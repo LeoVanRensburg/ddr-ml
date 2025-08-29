@@ -55,9 +55,24 @@ class AlbumentationsDataset(Dataset):
 
     @staticmethod
     def _read_img(path: str) -> np.ndarray:
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        # Silence libjpeg stderr spam (e.g., "Corrupt JPEG data: ...") during decode.
+        from contextlib import redirect_stderr
+        import os
+
+        with open(os.devnull, "w") as devnull, redirect_stderr(devnull):
+            img = cv2.imread(path, cv2.IMREAD_COLOR)
+
         if img is None:
-            raise FileNotFoundError(f"Failed to read image at {path}")
+            # Fallback: decode with PIL (handles some truncated/corrupt JPEGs) without warnings.
+            try:
+                from PIL import Image, ImageFile
+                ImageFile.LOAD_TRUNCATED_IMAGES = True
+                with open(path, "rb") as f:
+                    pil_img = Image.open(f).convert("RGB")
+                return np.array(pil_img)  # already RGB
+            except Exception:
+                raise FileNotFoundError(f"Failed to read image at {path}")
+
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     def _build_cpu_pipeline(self, cfg):
