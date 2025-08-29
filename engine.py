@@ -55,21 +55,46 @@ class AlbumentationsDataset(Dataset):
 
     @staticmethod
     def _read_img(path: str) -> np.ndarray:
-        # Silence libjpeg stderr spam (e.g., "Corrupt JPEG data: ...") during decode.
-        from contextlib import redirect_stderr
-        import os
+        # Suppress C-level libjpeg stderr (e.g., "Corrupt JPEG data: ...") during decode.
+        import os, sys
+        from contextlib import contextmanager
 
-        with open(os.devnull, "w") as devnull, redirect_stderr(devnull):
+        @contextmanager
+        def _silence_stderr_fd():
+            devnull = open(os.devnull, "w")
+            try:
+                fd = sys.stderr.fileno()
+            except Exception:
+                fd = None
+            if fd is None:
+                try:
+                    yield
+                finally:
+                    devnull.close()
+                return
+            saved = os.dup(fd)
+            os.dup2(devnull.fileno(), fd)
+            try:
+                yield
+            finally:
+                os.dup2(saved, fd)
+                os.close(saved)
+                devnull.close()
+
+        with _silence_stderr_fd():
             img = cv2.imread(path, cv2.IMREAD_COLOR)
 
         if img is None:
-            # Fallback: decode with PIL (handles some truncated/corrupt JPEGs) without warnings.
+            # Fallback: decode with PIL (also silenced)
             try:
-                from PIL import Image, ImageFile
-                ImageFile.LOAD_TRUNCATED_IMAGES = True
-                with open(path, "rb") as f:
-                    pil_img = Image.open(f).convert("RGB")
-                return np.array(pil_img)  # already RGB
+                with _silence_stderr_fd():
+                    from PIL import Image, ImageFile
+                    ImageFile.LOAD_TRUNCATED_IMAGES = True
+                    with open(path, "rb") as f:
+                        pil_img = Image.open(f)
+                        pil_img.load()
+                        pil_img = pil_img.convert("RGB")
+                return np.array(pil_img)
             except Exception:
                 raise FileNotFoundError(f"Failed to read image at {path}")
 
