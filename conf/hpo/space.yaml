@@ -1,0 +1,31 @@
+# @package _global_
+version_base: "1.3"
+
+hydra:
+  sweeper:
+    _target_: hydra_plugins.hydra_optuna_sweeper.optuna_sweeper.OptunaSweeper
+    study_name: ddr_search
+    direction: maximize
+    storage: sqlite:///./optunahpo.db
+    n_trials: 50
+    n_jobs: 1
+    max_failure_rate: 0.2
+
+    sampler:
+      _target_: optuna.samplers.TPESampler
+      multivariate: true
+      seed: 42
+
+    params:
+      optim.lr:               tag(log, interval(1e-6, 1e-3))      # ↓ upper bound
+      optim.weight_decay:     tag(log, interval(1e-5, 1e-2))      # ↓ two orders
+      optim.type:             choice(adamw, adamp)
+
+      scheduler.warmup_epochs: range(0, 9)
+
+      loss.gamma_neg:         interval(2, 4)                      # ↓ upper bound
+      mixup_cutmix.mixup_alpha:  interval(0.2, 0.6)               # ↑ lower bound
+      mixup_cutmix.cutmix_alpha: interval(0.2, 0.6)
+      mixup_cutmix.switch_epoch: interval(0.4, 0.8)
+      model.drop_path_rate:      interval(0.0, 0.1)               # ↓ upper bound
+      data.img_sz:               choice(448, 512, 600)

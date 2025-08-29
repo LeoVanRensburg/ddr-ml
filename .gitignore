@@ -1,0 +1,6 @@
+run*
+output*
+ddr*
+.idea/
+.venv/
+__pycache__

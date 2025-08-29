@@ -1,0 +1,104 @@
+hydra:
+  job_logging:
+    handlers:
+      console:
+        class: logging.StreamHandler
+        stream: ext://sys.stdout
+
+hpo:
+  fast_cv: false
+
+exp:
+  name: "baseline"
+  seed: 42
+  folds: 5
+  device: cuda
+  amp: true
+  determinism: false
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  channels_last: false        # disabled to avoid .view() stride issues
+  torch_compile: false
+
+data:
+  root: "ddr_binary_dataset/"
+  img_sz: 600
+  cache_images: false
+  balance_sampler: true
+  batch_size: 5
+  val_batch_size: 5
+  test_dir: "ddr_binary_dataset/test"
+  aug_cpu:
+    horizontal_flip: 0.5
+    vertical_flip: 0.3
+    rotation_deg: 25
+    randaugment:
+      ops: 3
+      mag: 12
+    color:
+      brightness: 0.4
+      contrast: 0.4
+      saturation: 0.4
+      hue: 0.1
+  aug_gpu:
+    random_erasing_p: 0.3
+    random_erasing_scale: [0.02, 0.15]
+    random_erasing_ratio: [0.3, 3.3]
+
+model:
+  name: "convnextv2_large"
+  pretrained: true
+  drop_rate: 0.3
+  drop_path_rate: 0.09509125175993187
+  num_classes: 2
+
+ema:
+  enable: true
+  decay: 0.9998
+
+optim:
+  type: "adamp"
+  lr: 2.5734596729092932e-05
+  weight_decay: 0.0011468059508985358
+  beta1: 0.9
+  beta2: 0.999
+  grad_clip_norm: 1.0
+
+scheduler:
+  type: "cosine"
+  warmup_epochs: 0
+  t_initial: 25
+  min_lr: 1e-7
+
+loss:
+  type: "asymmetric"
+  gamma_neg: 2.3440332002467406
+  gamma_pos: 0
+
+mixup_cutmix:
+  enable: true
+  mixup_alpha: 0.2409219183199856
+  cutmix_alpha: 0.4311003512675182
+  prob: 1.0
+  switch_epoch: 0.6494498708967807
+
+early_stop:
+  patience: 10
+
+swa:
+  enable: false
+  start_frac: 0.7
+  lr_factor: 0.1
+
+checkpoint:
+  dir: "output/checkpoints"
+  keep_last: 1
+  resume: auto
+
+logging:
+  console: true
+  rich_traceback: true
+  wandb: false
+  project: "ddr_binary"
