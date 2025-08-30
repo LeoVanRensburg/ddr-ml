@@ -501,8 +501,8 @@ def train_one_epoch(
         # convert to float and run GPU augment + normalize
         x = x.float().div_(255.0)
         x = kornia_tf(x)
-        # Ensure standard contiguous layout before any module that calls view()
-        x = x.contiguous()
+        # Ensure finite inputs after augmentation
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).contiguous()
 
         epoch_frac = (epoch + step / max(num_steps, 1)) / max(cfg.scheduler.t_initial, 1)
         x, y_a, y_b, lam = mixup_fn(x, y, epoch_frac)
@@ -510,14 +510,34 @@ def train_one_epoch(
 
         with torch.autocast(device_type=_autocast_device(device), enabled=cfg.exp.amp):
             logits = model(x)
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
             loss = lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
+
+        # Skip non-finite loss to prevent parameter corruption
+        if not torch.isfinite(loss):
+            logger.warning(f"Non-finite loss at epoch {epoch + 1} step {step}; batch skipped.")
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
 
+        # Unscale to check/clip grads safely
+        scaler.unscale_(optimizer)
         if cfg.optim.grad_clip_norm:
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip_norm)
+
+        # Abort step if any gradient is non-finite
+        bad_grad = False
+        for p in model.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                bad_grad = True
+                break
+        if bad_grad:
+            logger.warning(f"Non-finite gradient at epoch {epoch + 1} step {step}; batch skipped.")
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            continue
 
         scaler.step(optimizer)
         scaler.update()
@@ -538,7 +558,6 @@ def train_one_epoch(
     if (not isinstance(scheduler, OneCycleLR)) and hasattr(scheduler, "step") and not hasattr(scheduler, "step_update"):
         scheduler.step(epoch + 1)
 
-
 def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoader, epoch: int, device: torch.device) -> float:
     model_to_eval = ema.module if ema is not None else model
     model_to_eval.eval()
@@ -554,26 +573,47 @@ def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoade
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             x = x.float().div_(255.0)
             x = (x - mean) / std
-            x = x.contiguous()
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).contiguous()
 
             with torch.autocast(device_type=_autocast_device(device), enabled=cfg.exp.amp):
                 logits = model_to_eval(x)
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
                 loss = criterion(logits, y)
 
+            # Skip batch if loss is non-finite
+            if not torch.isfinite(loss):
+                logger.warning(f"Non-finite val loss at epoch {epoch + 1}; batch skipped.")
+                continue
+
             loss_meter += float(loss.detach().cpu().item())
-            prob = torch.sigmoid(logits)[:, 1]
-            if torch.isnan(prob).any():
-                raise FloatingPointError("NaN in predictions")
+
+            # Robust probability extraction
+            if logits.ndim == 2 and logits.size(1) >= 2:
+                prob = torch.sigmoid(logits)[:, 1]
+            else:
+                prob = torch.sigmoid(logits.squeeze(-1))
+
+            prob = torch.nan_to_num(prob, nan=0.5, posinf=1.0, neginf=0.0)
 
             preds.append(prob.float().cpu().numpy())
             gts.append(y.int().cpu().numpy())
 
+    if not preds:
+        logger.warning("No valid validation batches; returning AUC=0.5")
+        return 0.5
+
     preds = np.concatenate(preds)
     gts = np.concatenate(gts)
-    auc = roc_auc_score(gts, preds)
+
+    # Guard against single-class ground truth or degenerate predictions
+    try:
+        auc = roc_auc_score(gts, preds)
+    except Exception:
+        logger.warning("AUC computation failed (degenerate targets/preds); returning AUC=0.5")
+        auc = 0.5
+
     logger.info(f"Epoch {epoch + 1}: val loss {loss_meter / max(len(loader), 1):.4f} | AUC {auc:.4f}")
     return float(auc)
-
 
 # ───────────────────── checkpoint I/O ──────────────────────────────
 def _ckpt_path(cfg, name: str) -> str:

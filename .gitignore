@@ -6,3 +6,4 @@ ddr*
 __pycache__
 .DS_Store
 optunahpo.db
+multirun/
