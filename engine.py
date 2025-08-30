@@ -251,23 +251,56 @@ def build_model(cfg, device: torch.device):
 
 # ─────────────────── optimizer & scheduler ─────────────────────────
 def build_optimizer(cfg, model: nn.Module):
-    if str(cfg.optim.type).endswith("adamp"):
-        from adamp import AdamP
-        base_opt = AdamP(
-            model.parameters(),
+    """
+    Build optimizer with defensive defaults so third-party optimizers (e.g., AdamP)
+    get all the param group keys they expect across versions.
+    """
+    opt_type = str(cfg.optim.type).lower()
+
+    if opt_type.endswith("adamp"):
+        # AdamP expects 'nesterov' in each param group in some versions.
+        # Pull optional fields from cfg if present; otherwise use safe defaults.
+        try:
+            from adamp import AdamP
+        except Exception as e:
+            raise ImportError(
+                "optim.type=adamp requested but 'adamp' package is not available."
+            ) from e
+
+        kwargs = dict(
             lr=cfg.optim.lr,
             betas=(cfg.optim.beta1, cfg.optim.beta2),
             weight_decay=cfg.optim.weight_decay,
         )
+        # Optional AdamP-specific knobs with safe fallbacks
+        if hasattr(cfg.optim, "eps"):
+            kwargs["eps"] = cfg.optim.eps
+        if hasattr(cfg.optim, "delta"):
+            kwargs["delta"] = cfg.optim.delta
+        if hasattr(cfg.optim, "wd_ratio"):
+            kwargs["wd_ratio"] = cfg.optim.wd_ratio
+
+        # Critical: ensure 'nesterov' exists in defaults (and thus in param groups)
+        kwargs["nesterov"] = bool(getattr(cfg.optim, "nesterov", False))
+
+        base_opt = AdamP(model.parameters(), **kwargs)
+
+        # Harden param groups in case the underlying lib changes behavior
+        for g in base_opt.param_groups:
+            g.setdefault("nesterov", bool(getattr(cfg.optim, "nesterov", False)))
+
     else:
+        # Default to AdamW
         base_opt = torch.optim.AdamW(
             model.parameters(),
             lr=cfg.optim.lr,
             betas=(cfg.optim.beta1, cfg.optim.beta2),
             weight_decay=cfg.optim.weight_decay,
+            eps=getattr(cfg.optim, "eps", 1e-8),
         )
 
-    if str(cfg.optim.type).startswith("lookahead"):
+    # Optional Lookahead wrapper (kept as-is)
+    if opt_type.startswith("lookahead"):
         Lookahead = None
         try:
             from timm.optim.lookahead import Lookahead
@@ -645,6 +678,10 @@ def save_checkpoint(cfg, model, ema, optimizer, scheduler, epoch: int, fold_idx:
 
 
 def load_checkpoint(cfg, model, ema, optimizer, scheduler):
+    """
+    Load checkpoint and robustly patch optimizer param groups for
+    third-party expectations (e.g., AdamP needing 'nesterov').
+    """
     if str(cfg.checkpoint.resume) == "none":
         return 0, 0, -1.0
 
@@ -660,7 +697,14 @@ def load_checkpoint(cfg, model, ema, optimizer, scheduler):
         model.load_state_dict(state["model"])
         if ema and state.get("ema") is not None:
             ema.load_state_dict(state["ema"])
+
+        # Load optimizer (may be from a different lib/version)
         optimizer.load_state_dict(state["optimizer"])
+
+        # Patch missing fields expected by some optimizers
+        for g in optimizer.param_groups:
+            g.setdefault("nesterov", bool(getattr(cfg.optim, "nesterov", False)))
+
         if state.get("scheduler") is not None and hasattr(scheduler, "load_state_dict"):
             scheduler.load_state_dict(state["scheduler"])
 
