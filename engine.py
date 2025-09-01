@@ -676,18 +676,12 @@ def save_checkpoint(cfg, model, ema, optimizer, scheduler, epoch: int, fold_idx:
         return val_auc
     return best_auc
 
-
 def load_checkpoint(cfg, model, ema, optimizer, scheduler):
-    """
-    Load checkpoint and robustly patch optimizer param groups for
-    third-party expectations (e.g., AdamP needing 'nesterov').
-    """
     if str(cfg.checkpoint.resume) == "none":
         return 0, 0, -1.0
 
     path = (_ckpt_path(cfg, "last.pth") if str(cfg.checkpoint.resume) == "auto"
             else str(cfg.checkpoint.resume))
-
     if not os.path.isfile(path):
         logger.warning(f"Checkpoint not found at {path}, starting from scratch.")
         return 0, 0, -1.0
@@ -697,20 +691,20 @@ def load_checkpoint(cfg, model, ema, optimizer, scheduler):
         model.load_state_dict(state["model"])
         if ema and state.get("ema") is not None:
             ema.load_state_dict(state["ema"])
-
-        # Load optimizer (may be from a different lib/version)
         optimizer.load_state_dict(state["optimizer"])
-
-        # Patch missing fields expected by some optimizers
         for g in optimizer.param_groups:
             g.setdefault("nesterov", bool(getattr(cfg.optim, "nesterov", False)))
-
         if state.get("scheduler") is not None and hasattr(scheduler, "load_state_dict"):
             scheduler.load_state_dict(state["scheduler"])
 
         start_epoch = int(state.get("epoch", -1)) + 1
-        start_fold = int(state.get("fold_idx", 0))
-        best_auc = float(state.get("best_auc", -1.0))
+        start_fold  = int(state.get("fold_idx", 0))
+        best_auc    = float(state.get("best_auc", -1.0))
+
+        # If the checkpoint already completed the planned epochs, don’t resume.
+        if start_epoch >= int(cfg.scheduler.t_initial):
+            logger.info("Checkpoint is at/after planned epochs; restarting fresh.")
+            return 0, 0, -1.0
 
         logger.info(f"Resumed from {path} (epoch {start_epoch}, fold {start_fold + 1})")
         return start_epoch, start_fold, best_auc

@@ -26,3 +26,6 @@ hydra:
       mixup_cutmix.switch_epoch:  interval(0.4, 0.8)
       model.drop_path_rate:       interval(0.0, 0.1)
       data.img_sz:                choice(448, 512, 600)
+checkpoint:
+  dir: ${hydra:runtime.output_dir}/ckpt
+  resume: none
