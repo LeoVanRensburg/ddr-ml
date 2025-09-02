@@ -168,7 +168,9 @@ class AsymmetricLoss(nn.Module):
         else:
             target = target.to(logits.dtype)
 
-        x_sig = torch.sigmoid(logits)
+        # 💡 FIX: Clamp sigmoid output for extra safety, preventing exact 0.0 or 1.0.
+        x_sig = torch.sigmoid(logits).clamp(1e-8, 1.0 - 1e-8)
+
         pt = x_sig * target + (1 - x_sig) * (1 - target)
         grad = (1 - pt) ** (self.gp * target + self.gn * (1 - target))
         loss = -grad * (
@@ -176,7 +178,6 @@ class AsymmetricLoss(nn.Module):
             + (1 - target) * torch.log((1 - x_sig).clamp_min(1e-8))
         )
         return loss.mean()
-
 
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, alpha=1.0):
@@ -543,6 +544,8 @@ def train_one_epoch(
 
         with torch.autocast(device_type=_autocast_device(device), enabled=cfg.exp.amp):
             logits = model(x)
+            # 💡 FIX: Clamp logits to prevent numerical instability.
+            logits.clamp_(-15.0, 15.0)
             logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
             loss = lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
 
