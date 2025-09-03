@@ -244,7 +244,8 @@ def build_model(cfg, device: torch.device):
         pass
 
     if getattr(cfg.exp, "torch_compile", False):
-        model = torch.compile(model, mode="max-autotune")
+        # model = torch.compile(model, mode="max-autotune")
+        pass
 
     ema = timm.utils.ModelEmaV2(model, decay=cfg.ema.decay, device=device) if cfg.ema.enable else None
     return model, ema
@@ -535,7 +536,6 @@ def train_one_epoch(
         # convert to float and run GPU augment + normalize
         x = x.float().div_(255.0)
         x = kornia_tf(x)
-        # Ensure finite inputs after augmentation
         x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).contiguous()
 
         epoch_frac = (epoch + step / max(num_steps, 1)) / max(cfg.scheduler.t_initial, 1)
@@ -543,9 +543,13 @@ def train_one_epoch(
         x = x.contiguous()
 
         with torch.autocast(device_type=_autocast_device(device), enabled=cfg.exp.amp):
+            # 💡 FIX: Add a tiny amount of noise to prevent zero-variance batches.
+            # This is a robust way to prevent division-by-zero in normalization layers.
+            if cfg.exp.amp:
+                x.add_(torch.randn_like(x), alpha=1e-6)
+
             logits = model(x)
-            # 💡 FIX: Clamp logits to prevent numerical instability.
-            logits.clamp_(-15.0, 15.0)
+            logits.clamp_(-15.0, 15.0) # Keep the previous fix as well
             logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
             loss = lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
 
