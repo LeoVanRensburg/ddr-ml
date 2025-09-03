@@ -96,6 +96,7 @@ checkpoint:
   dir: "output/checkpoints"
   keep_last: 1
   resume: auto
+  save_heavy_every: 0
 
 logging:
   console: true

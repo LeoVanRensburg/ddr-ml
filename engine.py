@@ -13,6 +13,7 @@ cv2.setNumThreads(0)
 import numpy as np
 import torch
 import albumentations as A
+import gc
 
 from hydra import utils as hydra_utils
 from loguru import logger
@@ -37,6 +38,15 @@ def set_seed(seed: int) -> None:
 def _autocast_device(device: torch.device) -> str:
     return "cuda" if device.type == "cuda" else "cpu"
 
+def _cpu_state_dict(sd: dict) -> dict:
+    """Detach + move all tensors in a state_dict to CPU to keep checkpoint size/RAM low."""
+    out = {}
+    for k, v in sd.items():
+        if torch.is_tensor(v):
+            out[k] = v.detach().cpu()
+        else:
+            out[k] = v
+    return out
 
 # ─────────────────────── Dataset & transforms ─────────────────────
 class AlbumentationsDataset(Dataset):
@@ -598,6 +608,7 @@ def train_one_epoch(
     if (not isinstance(scheduler, OneCycleLR)) and hasattr(scheduler, "step") and not hasattr(scheduler, "step_update"):
         scheduler.step(epoch + 1)
 
+
 def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoader, epoch: int, device: torch.device) -> float:
     model_to_eval = ema.module if ema is not None else model
     model_to_eval.eval()
@@ -620,16 +631,17 @@ def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoade
                 logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
                 loss = criterion(logits, y)
 
-            # Skip batch if loss is non-finite
             if not torch.isfinite(loss):
                 logger.warning(f"Non-finite val loss at epoch {epoch + 1}; batch skipped.")
                 continue
 
             loss_meter += float(loss.detach().cpu().item())
 
-            # Robust probability extraction
+            # Probability extraction:
+            # - If multi-class (C>=2), use softmax and take class-1 probability (binary AUC convention).
+            # - If single-logit, use sigmoid.
             if logits.ndim == 2 and logits.size(1) >= 2:
-                prob = torch.sigmoid(logits)[:, 1]
+                prob = torch.softmax(logits, dim=1)[:, 1]
             else:
                 prob = torch.sigmoid(logits.squeeze(-1))
 
@@ -645,7 +657,6 @@ def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoade
     preds = np.concatenate(preds)
     gts = np.concatenate(gts)
 
-    # Guard against single-class ground truth or degenerate predictions
     try:
         auc = roc_auc_score(gts, preds)
     except Exception:
@@ -659,63 +670,126 @@ def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoade
 def _ckpt_path(cfg, name: str) -> str:
     return os.path.join(cfg.checkpoint.dir, name)
 
-
 def save_checkpoint(cfg, model, ema, optimizer, scheduler, epoch: int, fold_idx: int, val_auc: float, best_auc: float) -> float:
+    """
+    Memory-light checkpointing:
+      - Always write a light 'last.pth' containing model+EMA weights and minimal metadata.
+      - Optionally write a separate heavy 'last_heavy.pth' (optimizer/scheduler) every N epochs.
+      - On improvement, write model-only best files: 'best_model.pth' and 'ema_best_model.pth'.
+    """
     os.makedirs(cfg.checkpoint.dir, exist_ok=True)
 
     new_best = max(best_auc, val_auc)
-    state = {
-        "model": model.state_dict(),
-        "ema": (ema.state_dict() if ema else None),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict() if hasattr(scheduler, "state_dict") else None,
+
+    # 1) Light, resumable "last" (model + EMA + minimal metadata), all on CPU tensors.
+    light = {
+        "model": _cpu_state_dict(model.state_dict()),
+        "ema": (_cpu_state_dict(ema.state_dict()) if ema else None),  # keep EMA object state for proper resume
         "epoch": int(epoch),
         "fold_idx": int(fold_idx),
         "best_auc": float(new_best),
     }
-    torch.save(state, _ckpt_path(cfg, "last.pth"))
+    torch.save(light, _ckpt_path(cfg, "last.pth"))
+    del light
+    gc.collect()
 
+    # 2) Heavy bits (optimizer/scheduler) saved sparsely if configured.
+    save_heavy_every = int(getattr(cfg.checkpoint, "save_heavy_every", 0) or 0)
+    if save_heavy_every > 0 and ((epoch + 1) % save_heavy_every == 0):
+        heavy = {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": (scheduler.state_dict() if hasattr(scheduler, "state_dict") else None),
+            "epoch": int(epoch),
+            "fold_idx": int(fold_idx),
+            "best_auc": float(new_best),
+        }
+        torch.save(heavy, _ckpt_path(cfg, "last_heavy.pth"))
+        del heavy
+        gc.collect()
+
+    # 3) Best model-only snapshots (weights only; small; no optimizer).
     if val_auc > best_auc:
-        logger.info(f"New best AUC: {val_auc:.4f}. Saving best model.")
-        torch.save(state, _ckpt_path(cfg, "best.pth"))
+        logger.info(f"New best AUC: {val_auc:.4f}. Saving model-only checkpoints.")
+        torch.save(_cpu_state_dict(model.state_dict()), _ckpt_path(cfg, "best_model.pth"))
         if ema:
-            torch.save(state, _ckpt_path(cfg, "ema_best.pth"))
+            # store EMA *weights* (the averaged model parameters) as the best EMA model
+            torch.save(_cpu_state_dict(ema.module.state_dict()), _ckpt_path(cfg, "ema_best_model.pth"))
         return val_auc
+
     return best_auc
 
 def load_checkpoint(cfg, model, ema, optimizer, scheduler):
+    """
+    Robust resume:
+      - Supports the new light 'last.pth' (model+EMA only) plus optional 'last_heavy.pth'.
+      - Backward-compatible with legacy heavy 'last.pth' that already contains optimizer/scheduler.
+      - Also tolerates model-only files if user points resume at them (starts optimizers fresh).
+    """
     if str(cfg.checkpoint.resume) == "none":
         return 0, 0, -1.0
 
-    path = (_ckpt_path(cfg, "last.pth") if str(cfg.checkpoint.resume) == "auto"
+    base = (_ckpt_path(cfg, "last.pth") if str(cfg.checkpoint.resume) == "auto"
             else str(cfg.checkpoint.resume))
-    if not os.path.isfile(path):
-        logger.warning(f"Checkpoint not found at {path}, starting from scratch.")
+    if not os.path.isfile(base):
+        logger.warning(f"Checkpoint not found at {base}, starting from scratch.")
         return 0, 0, -1.0
 
     try:
-        state = torch.load(path, map_location="cpu")
-        model.load_state_dict(state["model"])
-        if ema and state.get("ema") is not None:
-            ema.load_state_dict(state["ema"])
-        optimizer.load_state_dict(state["optimizer"])
+        state = torch.load(base, map_location="cpu")
+
+        # Load model weights (handle both dict-with-model and raw state_dict cases).
+        if isinstance(state, dict) and "model" in state:
+            model.load_state_dict(state["model"])
+        else:
+            model.load_state_dict(state)
+
+        # Load EMA if available and requested.
+        if ema is not None:
+            ema_state = (state.get("ema") if isinstance(state, dict) else None)
+            if ema_state is not None:
+                ema.load_state_dict(ema_state)
+
+        # Try to load optimizer/scheduler either from this file (legacy heavy last.pth)
+        # or from a separate heavy sidecar file.
+        loaded_heavy = False
+        if isinstance(state, dict) and state.get("optimizer") is not None:
+            optimizer.load_state_dict(state["optimizer"])
+            if state.get("scheduler") is not None and hasattr(scheduler, "load_state_dict"):
+                scheduler.load_state_dict(state["scheduler"])
+            loaded_heavy = True
+        else:
+            heavy_path = _ckpt_path(cfg, "last_heavy.pth")
+            if os.path.isfile(heavy_path):
+                heavy = torch.load(heavy_path, map_location="cpu")
+                optimizer.load_state_dict(heavy["optimizer"])
+                if heavy.get("scheduler") is not None and hasattr(scheduler, "load_state_dict"):
+                    scheduler.load_state_dict(heavy["scheduler"])
+                loaded_heavy = True
+
+        # Harden param groups for AdamP edge-case (keeps compatibility across versions).
         for g in optimizer.param_groups:
             g.setdefault("nesterov", bool(getattr(cfg.optim, "nesterov", False)))
-        if state.get("scheduler") is not None and hasattr(scheduler, "load_state_dict"):
-            scheduler.load_state_dict(state["scheduler"])
 
-        start_epoch = int(state.get("epoch", -1)) + 1
-        start_fold  = int(state.get("fold_idx", 0))
-        best_auc    = float(state.get("best_auc", -1.0))
+        # Epoch/fold/best metadata if present; otherwise default.
+        epoch_in_state = (state.get("epoch") if isinstance(state, dict) else None)
+        fold_in_state  = (state.get("fold_idx") if isinstance(state, dict) else None)
+        best_in_state  = (state.get("best_auc") if isinstance(state, dict) else None)
 
-        # If the checkpoint already completed the planned epochs, don’t resume.
+        start_epoch = int(epoch_in_state if epoch_in_state is not None else -1) + 1
+        start_fold  = int(fold_in_state if fold_in_state is not None else 0)
+        best_auc    = float(best_in_state if best_in_state is not None else -1.0)
+
+        # If the checkpoint already completed the planned epochs, restart fresh.
         if start_epoch >= int(cfg.scheduler.t_initial):
             logger.info("Checkpoint is at/after planned epochs; restarting fresh.")
             return 0, 0, -1.0
 
-        logger.info(f"Resumed from {path} (epoch {start_epoch}, fold {start_fold + 1})")
+        source = base if (isinstance(state, dict) and "model" in state) else "model-only file"
+        extra  = " + heavy" if loaded_heavy else ""
+        logger.info(f"Resumed from {source}{extra} (epoch {start_epoch}, fold {start_fold + 1})")
         return start_epoch, start_fold, best_auc
+
     except Exception as e:
-        logger.error(f"Failed to load checkpoint from {path}: {e}")
+        logger.error(f"Failed to load checkpoint from {base}: {e}")
         logger.warning("Starting from scratch.")
         return 0, 0, -1.0
