@@ -166,27 +166,39 @@ def build_kornia(cfg):
 
 # ───────────────────── loss variants ───────────────────────────────
 class AsymmetricLoss(nn.Module):
-    def __init__(self, gamma_neg=4.0, gamma_pos=0.0):
+    """
+    Numerically stable asymmetric focal-style BCE.
+    Computes all sensitive ops in fp32 using softplus identities, so it is safe
+    under autocast/AMP and avoids log(0)/Inf/NaN.
+
+    log(sigmoid(x))     = -softplus(-x)
+    log(1 - sigmoid(x)) = -softplus(x)
+    """
+    def __init__(self, gamma_neg: float = 4.0, gamma_pos: float = 0.0):
         super().__init__()
-        self.gn = gamma_neg
-        self.gp = gamma_pos
+        self.gn = float(gamma_neg)
+        self.gp = float(gamma_pos)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Accept targets as class indices or one-hot/multi-label.
         if target.ndim == 1:
             target = torch.nn.functional.one_hot(target, num_classes=logits.shape[1])
-            target = target.to(logits.dtype)
-        else:
-            target = target.to(logits.dtype)
 
-        # 💡 FIX: Clamp sigmoid output for extra safety, preventing exact 0.0 or 1.0.
-        x_sig = torch.sigmoid(logits).clamp(1e-8, 1.0 - 1e-8)
+        # Do all math in fp32 on the same device, regardless of autocast dtype.
+        logits_f = logits.float()
+        target_f = target.to(dtype=torch.float32, device=logits_f.device)
 
-        pt = x_sig * target + (1 - x_sig) * (1 - target)
-        grad = (1 - pt) ** (self.gp * target + self.gn * (1 - target))
-        loss = -grad * (
-            target * torch.log(x_sig.clamp_min(1e-8))
-            + (1 - target) * torch.log((1 - x_sig).clamp_min(1e-8))
-        )
+        # Probabilities and focal weight.
+        p = torch.sigmoid(logits_f)  # in (0,1) for finite logits
+        pt = p * target_f + (1.0 - p) * (1.0 - target_f)
+        gamma = self.gp * target_f + self.gn * (1.0 - target_f)
+        weight = (1.0 - pt).pow(gamma)
+
+        # Stable log-probs via softplus (no log(0)).
+        logp = -torch.nn.functional.softplus(-logits_f)  # log(sigmoid)
+        log1mp = -torch.nn.functional.softplus(logits_f) # log(1 - sigmoid)
+
+        loss = -weight * (target_f * logp + (1.0 - target_f) * log1mp)
         return loss.mean()
 
 class FocalLoss(nn.Module):
