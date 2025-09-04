@@ -48,6 +48,16 @@ def _cpu_state_dict(sd: dict) -> dict:
             out[k] = v
     return out
 
+def _move_optimizer_state(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    """
+    Move all optimizer state tensors to the target device.
+    Required to truly free CUDA memory when pausing and to restore on resume.
+    """
+    for state in optimizer.state.values():
+        for k, v in list(state.items()):
+            if torch.is_tensor(v):
+                state[k] = v.to(device, non_blocking=True)
+
 # ─────────────────────── Dataset & transforms ─────────────────────
 class AlbumentationsDataset(Dataset):
     """
@@ -523,6 +533,7 @@ def train_one_epoch(
 
     scaler = torch.amp.GradScaler(enabled=cfg.exp.amp, growth_interval=15000)
     is_paused = False
+    offloaded = False  # model/opt moved to CPU while paused
 
     bar = tqdm(
         loader,
@@ -536,14 +547,36 @@ def train_one_epoch(
     shown_steps = 0
 
     for step, (x, y) in enumerate(bar, start=1):
-        # Pause handling
+        # ── Pause handling ────────────────────────────────────────────────
         if stdscr is not None:
             key = stdscr.getch()
             if key in (ord("p"), ord("P")):
                 is_paused = not is_paused
+                if is_paused:
+                    # Offload model/EMA/optimizer state to CPU and free VRAM.
+                    try:
+                        if device.type == "cuda":
+                            optimizer.zero_grad(set_to_none=True)
+                            try:
+                                torch.cuda.synchronize()
+                            except Exception:
+                                pass
+                            model.to("cpu")
+                            if ema is not None:
+                                ema.module.to("cpu")
+                            _move_optimizer_state(optimizer, torch.device("cpu"))
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                            gc.collect()
+                            offloaded = True
+                    except Exception:
+                        pass
+
             while is_paused:
                 try:
-                    stdscr.addstr(0, 0, "[PAUSED] Press 'P' to resume...".ljust(80))
+                    stdscr.addstr(0, 0, "[PAUSED] VRAM freed. Press 'P' to resume...".ljust(120))
                     stdscr.refresh()
                 except Exception:
                     pass
@@ -551,6 +584,17 @@ def train_one_epoch(
                 key = stdscr.getch()
                 if key in (ord("p"), ord("P")):
                     is_paused = False
+                    # Reload back to original device.
+                    try:
+                        if offloaded:
+                            tgt = device
+                            model.to(tgt)
+                            if ema is not None:
+                                ema.module.to(tgt)
+                            _move_optimizer_state(optimizer, tgt)
+                            offloaded = False
+                    except Exception:
+                        pass
 
         # x: uint8 CHW on CPU
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -565,17 +609,16 @@ def train_one_epoch(
         x = x.contiguous()
 
         with torch.autocast(device_type=_autocast_device(device), enabled=cfg.exp.amp):
-            # 💡 FIX: Add a tiny amount of noise to prevent zero-variance batches.
-            # This is a robust way to prevent division-by-zero in normalization layers.
+            # Add tiny noise to avoid zero-variance batches under AMP.
             if cfg.exp.amp:
                 x.add_(torch.randn_like(x), alpha=1e-6)
 
             logits = model(x)
-            logits.clamp_(-15.0, 15.0) # Keep the previous fix as well
+            logits.clamp_(-15.0, 15.0)
             logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
             loss = lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
 
-        # Skip non-finite loss to prevent parameter corruption
+        # Skip non-finite loss
         if not torch.isfinite(loss):
             logger.warning(f"Non-finite loss at epoch {epoch + 1} step {step}; batch skipped.")
             optimizer.zero_grad(set_to_none=True)

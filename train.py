@@ -39,6 +39,7 @@ def _device_from_cfg(cfg: DictConfig) -> torch.device:
 def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
     """
     Curses-wrapped training entry. Returns best AUC across folds.
+    Clears the terminal at each epoch and supports pause that offloads VRAM.
     """
     # ── Curses screen setup ────────────────────────────────────────────────
     stdscr.nodelay(True)
@@ -57,6 +58,11 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
             pass
 
     # ── Logging / determinism / device ────────────────────────────────────
+    # Remove default console sink so warnings don't clutter the terminal.
+    try:
+        logger.remove()
+    except Exception:
+        pass
     _setup_logger_to_hydra_run_dir()
     logger.info("CONFIG:\n" + OmegaConf.to_yaml(cfg))
 
@@ -84,8 +90,9 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
 
     try:
         for fold_idx, (tr_idx, val_idx) in enumerate(folds[start_fold:], start=start_fold):
-            update_line(2, "")
-            update_line(3, "")
+            # Clear screen at the start of each fold.
+            stdscr.erase()
+            stdscr.refresh()
 
             fold_msg = f"===== Fold {fold_idx + 1}/{cfg.exp.folds} ====="
             update_line(1, fold_msg)
@@ -98,6 +105,11 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
             local_best_auc = best_auc
 
             for epoch in range(start_epoch, cfg.scheduler.t_initial):
+                # ── CLEAR TERMINAL BETWEEN EPOCHS ────────────────────────
+                stdscr.erase()
+                stdscr.refresh()
+                update_line(0, "Training started. Press 'P' to pause/resume.")
+                update_line(1, fold_msg)
                 update_line(2, f"Epoch {epoch + 1}/{cfg.scheduler.t_initial} running (Fold {fold_idx + 1})...")
 
                 engine.train_one_epoch(
