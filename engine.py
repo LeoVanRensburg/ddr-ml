@@ -533,7 +533,7 @@ def train_one_epoch(
 
     scaler = torch.amp.GradScaler(enabled=cfg.exp.amp, growth_interval=15000)
     is_paused = False
-    offloaded = False  # model/opt moved to CPU while paused
+    offloaded = False  # model/opt moved to CPU during pause
 
     bar = tqdm(
         loader,
@@ -553,7 +553,12 @@ def train_one_epoch(
             if key in (ord("p"), ord("P")):
                 is_paused = not is_paused
                 if is_paused:
-                    # Offload model/EMA/optimizer state to CPU and free VRAM.
+                    # Hide the tqdm line to avoid stale/duplicate bars.
+                    try:
+                        bar.clear(nolock=True)
+                    except Exception:
+                        pass
+                    # Offload model/EMA/optimizer to CPU and free VRAM.
                     try:
                         if device.type == "cuda":
                             optimizer.zero_grad(set_to_none=True)
@@ -573,14 +578,15 @@ def train_one_epoch(
                             offloaded = True
                     except Exception:
                         pass
+                    # Draw pause banner.
+                    try:
+                        stdscr.addstr(0, 0, "[PAUSED] VRAM freed. Press 'P' to resume...".ljust(120))
+                        stdscr.refresh()
+                    except Exception:
+                        pass
 
             while is_paused:
-                try:
-                    stdscr.addstr(0, 0, "[PAUSED] VRAM freed. Press 'P' to resume...".ljust(120))
-                    stdscr.refresh()
-                except Exception:
-                    pass
-                time.sleep(0.2)
+                time.sleep(0.15)
                 key = stdscr.getch()
                 if key in (ord("p"), ord("P")):
                     is_paused = False
@@ -593,6 +599,17 @@ def train_one_epoch(
                                 ema.module.to(tgt)
                             _move_optimizer_state(optimizer, tgt)
                             offloaded = False
+                    except Exception:
+                        pass
+                    # Clear pause banner and force tqdm to redraw.
+                    try:
+                        stdscr.move(0, 0)
+                        stdscr.clrtoeol()
+                        stdscr.refresh()
+                    except Exception:
+                        pass
+                    try:
+                        bar.refresh(nolock=True)
                     except Exception:
                         pass
 
@@ -609,7 +626,6 @@ def train_one_epoch(
         x = x.contiguous()
 
         with torch.autocast(device_type=_autocast_device(device), enabled=cfg.exp.amp):
-            # Add tiny noise to avoid zero-variance batches under AMP.
             if cfg.exp.amp:
                 x.add_(torch.randn_like(x), alpha=1e-6)
 
