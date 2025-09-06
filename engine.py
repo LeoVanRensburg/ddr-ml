@@ -26,6 +26,7 @@ import timm
 import kornia.augmentation as K
 from tqdm import tqdm
 import json
+from collections import OrderedDict
 
 
 # ───────────────────────────── utils ──────────────────────────────
@@ -85,17 +86,61 @@ def clear_resume_marker(cfg) -> None:
 # ─────────────────────── Dataset & transforms ─────────────────────
 class AlbumentationsDataset(Dataset):
     """
-    Memory-safe pipeline: CPU does resize/pad/crop. Outputs uint8 CHW tensors.
-    Normalization and heavy aug run on GPU.
+    Memory-safe pipeline with bounded cache:
+      - Cache stage: deterministic resize+pad to square (HWC uint8).
+      - Per-iteration stochastic crop happens on the cached image (keeps aug diversity).
+      - Cache is LRU-bounded by cfg.data.cache_max_gb to avoid RAM blow-ups.
     """
+    class _LRU:
+        def __init__(self, max_bytes: int):
+            self.max_bytes = int(max_bytes)
+            self.bytes = 0
+            self.od = OrderedDict()  # idx -> np.ndarray
+
+        def get(self, idx: int):
+            arr = self.od.pop(idx, None)
+            if arr is not None:
+                self.od[idx] = arr  # move to back (MRU)
+            return arr
+
+        def put(self, idx: int, arr: np.ndarray):
+            b = int(arr.nbytes)
+            if b > self.max_bytes:
+                return  # item itself exceeds budget; skip caching
+            # Evict until fits
+            while self.bytes + b > self.max_bytes and self.od:
+                k, v = self.od.popitem(last=False)
+                self.bytes -= int(v.nbytes)
+            if idx in self.od:
+                self.bytes -= int(self.od[idx].nbytes)
+                self.od.pop(idx, None)
+            self.od[idx] = arr
+            self.bytes += b
+
+        def __len__(self):
+            return len(self.od)
+
     def __init__(self, img_paths: Sequence[str], labels: Sequence[int], cfg):
         self.paths: List[str] = list(img_paths)
         self.labels: List[int] = list(labels)
         self.cfg = cfg
-        self.tf_cpu = self._build_cpu_pipeline(cfg)
-        self.use_cache = bool(cfg.data.cache_images)
-        if self.use_cache:
-            self._cache = [self._read_img(p) for p in self.paths]
+
+        # Deterministic stage to enable reusable cache (no randomness here).
+        self.tf_cache = A.Compose([
+            A.LongestMaxSize(max_size=int(cfg.data.img_sz * 1.15)),
+            A.PadIfNeeded(
+                min_height=cfg.data.img_sz,
+                min_width=cfg.data.img_sz,
+                border_mode=cv2.BORDER_REFLECT_101,
+            ),
+        ])
+        # Stochastic crop applied every __getitem__ (keeps randomness across epochs)
+        self.tf_crop = A.RandomCrop(cfg.data.img_sz, cfg.data.img_sz)
+
+        # Bounded LRU cache in system RAM (per worker)
+        self.enable_cache = bool(getattr(cfg.data, "cache_images", False))
+        max_gb = float(getattr(cfg.data, "cache_max_gb", 8.0))  # NEW: config knob
+        self._cache = self._LRU(max_bytes=int(max_gb * (1024 ** 3))) if self.enable_cache else None
 
     @staticmethod
     def _read_img(path: str) -> np.ndarray:
@@ -129,7 +174,6 @@ class AlbumentationsDataset(Dataset):
             img = cv2.imread(path, cv2.IMREAD_COLOR)
 
         if img is None:
-            # Fallback: decode with PIL (also silenced)
             try:
                 with _silence_stderr_fd():
                     from PIL import Image, ImageFile
@@ -144,27 +188,29 @@ class AlbumentationsDataset(Dataset):
 
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    def _build_cpu_pipeline(self, cfg):
-        return A.Compose([
-            A.LongestMaxSize(max_size=int(cfg.data.img_sz * 1.15)),
-            A.PadIfNeeded(
-                min_height=cfg.data.img_sz,
-                min_width=cfg.data.img_sz,
-                border_mode=cv2.BORDER_REFLECT_101,
-            ),
-            A.RandomCrop(cfg.data.img_sz, cfg.data.img_sz),
-        ])
-
     def __len__(self) -> int:
         return len(self.paths)
 
     def __getitem__(self, idx: int):
-        img = self._cache[idx] if self.use_cache else self._read_img(self.paths[idx])
-        img = self.tf_cpu(image=img)["image"]  # HWC uint8
-        x = torch.from_numpy(img).permute(2, 0, 1).contiguous()  # CHW uint8 contiguous
+        # Try cache (resized+pad stage)
+        if self._cache is not None:
+            cached = self._cache.get(idx)
+        else:
+            cached = None
+
+        if cached is None:
+            img = self._read_img(self.paths[idx])  # HWC uint8 (original size)
+            base = self.tf_cache(image=img)["image"]  # HWC uint8, deterministic square
+            if self._cache is not None:
+                self._cache.put(idx, base)
+        else:
+            base = cached
+
+        # Per-sample stochastic crop on the cached base
+        cropped = self.tf_crop(image=base)["image"]  # HWC uint8
+        x = torch.from_numpy(cropped).permute(2, 0, 1).contiguous()  # CHW uint8
         y = int(self.labels[idx])
         return x, y
-
 
 # ───────────────────────── kornia GPU aug ─────────────────────────
 def build_kornia(cfg):
@@ -197,7 +243,63 @@ def build_kornia(cfg):
         same_on_batch=False,
     )
 
+class CUDAPrefetcher:
+    """
+    Overlaps H2D copies and GPU augment/normalize with compute via a side CUDA stream.
+    Produces device tensors already normalized (through kornia_tf).
+    """
+    def __init__(self, loader: DataLoader, device: torch.device, kornia_tf, channels_last: bool = False):
+        self.loader_iter = iter(loader)
+        self.device = device
+        self.kornia_tf = kornia_tf
+        self.channels_last = bool(channels_last)
+        self.stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self.next_batch = None
+        self._preload()
 
+    def _preload(self):
+        try:
+            x, y = next(self.loader_iter)
+        except StopIteration:
+            self.next_batch = None
+            return
+
+        if self.stream is None:
+            # CPU or non-CUDA device path – keep behavior consistent.
+            x = x.to(self.device, non_blocking=True).float().div_(255.0)
+            y = y.to(self.device, non_blocking=True)
+            x = self.kornia_tf(x)
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).contiguous()
+            if self.channels_last:
+                x = x.to(memory_format=torch.channels_last)
+            self.next_batch = (x, y)
+            return
+
+        # CUDA path: stage work on the copy/aug stream.
+        with torch.cuda.stream(self.stream):
+            x = x.to(self.device, non_blocking=True).float().div_(255.0)
+            y = y.to(self.device, non_blocking=True)
+            x = self.kornia_tf(x)
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).contiguous()
+            if self.channels_last:
+                x = x.to(memory_format=torch.channels_last)
+        self.next_batch = (x, y)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.next_batch is None:
+            raise StopIteration
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+        x, y = self.next_batch
+        # Ensure lifetime of the tensors on the current stream.
+        if hasattr(x, "record_stream"):
+            x.record_stream(torch.cuda.current_stream())
+            y.record_stream(torch.cuda.current_stream())
+        self._preload()
+        return x, y
 # ───────────────────── loss variants ───────────────────────────────
 class AsymmetricLoss(nn.Module):
     """
@@ -286,7 +388,7 @@ def build_model(cfg, device: torch.device):
         drop_path_rate=cfg.model.drop_path_rate,
     ).to(device)
 
-    # Keep standard memory format to prevent .view() issues from 3rd-party code.
+    # Enable fast kernels / heuristics
     try:
         import torch.backends.cudnn as cudnn
         cudnn.benchmark = True
@@ -299,65 +401,66 @@ def build_model(cfg, device: torch.device):
     except Exception:
         pass
 
-    if getattr(cfg.exp, "torch_compile", False):
-        # model = torch.compile(model, mode="max-autotune")
-        pass
+    # Optional memory format for conv-heavy nets
+    if bool(getattr(cfg.exp, "channels_last", False)):
+        try:
+            model.to(memory_format=torch.channels_last)
+        except Exception:
+            logger.warning("channels_last requested but not supported by the model; continuing.")
+
+    # Optional compile (PyTorch 2.x)
+    if bool(getattr(cfg.exp, "torch_compile", False)):
+        try:
+            model = torch.compile(model, mode="max-autotune")
+        except Exception as e:
+            logger.warning(f"torch.compile failed ({e}); continuing without compile.")
 
     ema = timm.utils.ModelEmaV2(model, decay=cfg.ema.decay, device=device) if cfg.ema.enable else None
     return model, ema
 
-
 # ─────────────────── optimizer & scheduler ─────────────────────────
 def build_optimizer(cfg, model: nn.Module):
     """
-    Build optimizer with defensive defaults so third-party optimizers (e.g., AdamP)
-    get all the param group keys they expect across versions.
+    Builds AdamW (fused when available) or AdamP with hardened param-group defaults.
     """
     opt_type = str(cfg.optim.type).lower()
 
     if opt_type.endswith("adamp"):
-        # AdamP expects 'nesterov' in each param group in some versions.
-        # Pull optional fields from cfg if present; otherwise use safe defaults.
         try:
             from adamp import AdamP
         except Exception as e:
-            raise ImportError(
-                "optim.type=adamp requested but 'adamp' package is not available."
-            ) from e
+            raise ImportError("optim.type=adamp requested but 'adamp' package is not available.") from e
 
         kwargs = dict(
             lr=cfg.optim.lr,
             betas=(cfg.optim.beta1, cfg.optim.beta2),
             weight_decay=cfg.optim.weight_decay,
         )
-        # Optional AdamP-specific knobs with safe fallbacks
-        if hasattr(cfg.optim, "eps"):
-            kwargs["eps"] = cfg.optim.eps
-        if hasattr(cfg.optim, "delta"):
-            kwargs["delta"] = cfg.optim.delta
-        if hasattr(cfg.optim, "wd_ratio"):
-            kwargs["wd_ratio"] = cfg.optim.wd_ratio
-
-        # Critical: ensure 'nesterov' exists in defaults (and thus in param groups)
+        # Optional AdamP-specific knobs
+        if hasattr(cfg.optim, "eps"):       kwargs["eps"] = cfg.optim.eps
+        if hasattr(cfg.optim, "delta"):     kwargs["delta"] = cfg.optim.delta
+        if hasattr(cfg.optim, "wd_ratio"):  kwargs["wd_ratio"] = cfg.optim.wd_ratio
         kwargs["nesterov"] = bool(getattr(cfg.optim, "nesterov", False))
 
         base_opt = AdamP(model.parameters(), **kwargs)
 
-        # Harden param groups in case the underlying lib changes behavior
         for g in base_opt.param_groups:
             g.setdefault("nesterov", bool(getattr(cfg.optim, "nesterov", False)))
 
     else:
-        # Default to AdamW
-        base_opt = torch.optim.AdamW(
-            model.parameters(),
+        # Default to AdamW; use fused kernels if present (PyTorch >= 2.0 + CUDA)
+        fused_supported = "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
+        kwargs = dict(
             lr=cfg.optim.lr,
             betas=(cfg.optim.beta1, cfg.optim.beta2),
             weight_decay=cfg.optim.weight_decay,
             eps=getattr(cfg.optim, "eps", 1e-8),
         )
+        if fused_supported and torch.cuda.is_available():
+            kwargs["fused"] = True
+        base_opt = torch.optim.AdamW(model.parameters(), **kwargs)
 
-    # Optional Lookahead wrapper (kept as-is)
+    # Optional Lookahead wrapper
     if opt_type.startswith("lookahead"):
         Lookahead = None
         try:
@@ -372,7 +475,6 @@ def build_optimizer(cfg, model: nn.Module):
         else:
             logger.warning("Lookahead requested but implementation not found; using base optimizer.")
     return base_opt
-
 
 def build_scheduler(cfg, optimizer, steps_per_epoch: int):
     if cfg.scheduler.type == "onecycle":
@@ -553,83 +655,75 @@ def train_one_epoch(
     stdscr=None,
 ) -> None:
     model.train()
-    num_steps = len(loader)
+    torch.cuda.synchronize() if device.type == "cuda" else None
 
+    num_steps = len(loader)
     scaler = torch.amp.GradScaler(enabled=cfg.exp.amp, growth_interval=15000)
+    accum = int(getattr(cfg.optim, "grad_accum_steps", 1) or 1)
+
+    # Prefetcher overlaps H2D + GPU aug with compute
+    prefetch = CUDAPrefetcher(loader, device, kornia_tf, channels_last=bool(getattr(cfg.exp, "channels_last", False)))
+
     is_paused = False
-    offloaded = False  # model/opt moved to CPU during pause
+    offloaded = False
 
     bar = tqdm(
-        loader,
-        desc=f"Epoch {epoch + 1}/{cfg.scheduler.t_initial}",
         total=num_steps,
+        desc=f"Epoch {epoch + 1}/{cfg.scheduler.t_initial}",
         dynamic_ncols=True,
         leave=False,
     )
 
     running_loss = 0.0
-    shown_steps = 0
+    shown = 0
+    step_count = 0  # counts batches consumed
 
-    for step, (x, y) in enumerate(bar, start=1):
-        # ── Pause handling ────────────────────────────────────────────────
+    optimizer.zero_grad(set_to_none=True)
+
+    for (x, y) in prefetch:
+        step_count += 1
+
+        # ── Pause toggle (curses UI) ─────────────────────────────────────
         if stdscr is not None:
             key = stdscr.getch()
             if key in (ord("p"), ord("P")):
                 is_paused = not is_paused
                 if is_paused:
-                    # Hide the tqdm line to avoid stale/duplicate bars.
-                    try:
-                        bar.clear(nolock=True)
-                    except Exception:
-                        pass
-                    # Offload model/EMA/optimizer to CPU and free VRAM.
+                    try: bar.clear(nolock=True)
+                    except Exception: pass
                     try:
                         if device.type == "cuda":
                             optimizer.zero_grad(set_to_none=True)
-                            try:
-                                torch.cuda.synchronize()
-                            except Exception:
-                                pass
+                            torch.cuda.synchronize()
                             model.to("cpu")
-                            if ema is not None:
-                                ema.module.to("cpu")
+                            if ema is not None: ema.module.to("cpu")
                             _move_optimizer_state(optimizer, torch.device("cpu"))
-                            try:
-                                torch.cuda.empty_cache()
-                            except Exception:
-                                pass
+                            torch.cuda.empty_cache()
                             gc.collect()
                             offloaded = True
                     except Exception:
                         pass
-                    # Draw pause banner.
                     try:
                         stdscr.addstr(0, 0, "[PAUSED] VRAM freed. Press 'P' to resume...".ljust(120))
                         stdscr.refresh()
                     except Exception:
                         pass
-
             while is_paused:
                 time.sleep(0.15)
                 key = stdscr.getch()
                 if key in (ord("p"), ord("P")):
                     is_paused = False
-                    # Reload back to original device.
                     try:
                         if offloaded:
                             tgt = device
                             model.to(tgt)
-                            if ema is not None:
-                                ema.module.to(tgt)
+                            if ema is not None: ema.module.to(tgt)
                             _move_optimizer_state(optimizer, tgt)
                             offloaded = False
                     except Exception:
                         pass
-                    # Clear pause banner and force tqdm to redraw.
                     try:
-                        stdscr.move(0, 0)
-                        stdscr.clrtoeol()
-                        stdscr.refresh()
+                        stdscr.move(0, 0); stdscr.clrtoeol(); stdscr.refresh()
                     except Exception:
                         pass
                     try:
@@ -637,72 +731,63 @@ def train_one_epoch(
                     except Exception:
                         pass
 
-        # x: uint8 CHW on CPU
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-
-        # convert to float and run GPU augment + normalize
-        x = x.float().div_(255.0)
-        x = kornia_tf(x)
-        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).contiguous()
-
-        epoch_frac = (epoch + step / max(num_steps, 1)) / max(cfg.scheduler.t_initial, 1)
+        # Mixup/Cutmix after normalization (GPU)
+        epoch_frac = (epoch + step_count / max(num_steps, 1)) / max(cfg.scheduler.t_initial, 1)
         x, y_a, y_b, lam = mixup_fn(x, y, epoch_frac)
         x = x.contiguous()
 
         with torch.autocast(device_type=_autocast_device(device), enabled=cfg.exp.amp):
             if cfg.exp.amp:
-                x.add_(torch.randn_like(x), alpha=1e-6)
+                x.add_(torch.randn_like(x), alpha=1e-6)  # tiny noise for AMP stability
 
             logits = model(x)
             logits.clamp_(-15.0, 15.0)
             logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
-            loss = lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
 
-        # Skip non-finite loss
+            loss = lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
+            loss = loss / accum
+
+        # Skip non-finite loss (rare)
         if not torch.isfinite(loss):
-            logger.warning(f"Non-finite loss at epoch {epoch + 1} step {step}; batch skipped.")
+            logger.warning(f"Non-finite loss at epoch {epoch + 1} step {step_count}; batch skipped.")
             optimizer.zero_grad(set_to_none=True)
+            bar.update(1)
             continue
 
-        optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
 
-        # Unscale to check/clip grads safely
-        scaler.unscale_(optimizer)
-        if cfg.optim.grad_clip_norm:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip_norm)
+        # Unscale once per (accum) and clip
+        if (step_count % accum) == 0:
+            scaler.unscale_(optimizer)
+            if cfg.optim.grad_clip_norm:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip_norm)
 
-        # Abort step if any gradient is non-finite
-        bad_grad = False
-        for p in model.parameters():
-            if p.grad is not None and not torch.isfinite(p.grad).all():
-                bad_grad = True
-                break
-        if bad_grad:
-            logger.warning(f"Non-finite gradient at epoch {epoch + 1} step {step}; batch skipped.")
-            optimizer.zero_grad(set_to_none=True)
+            scaler.step(optimizer)
             scaler.update()
-            continue
+            optimizer.zero_grad(set_to_none=True)
 
-        scaler.step(optimizer)
-        scaler.update()
-
-        _scheduler_step_per_batch(scheduler, epoch, step, num_steps)
+        # Per-batch scheduler step/update (works with CosineLRScheduler/OneCycleLR)
+        _scheduler_step_per_batch(scheduler, epoch, step_count, num_steps)
 
         if ema is not None:
             ema.update(model)
 
-        if step % 10 == 0:
-            running_loss += loss.detach().cpu().item()
-            shown_steps += 1
+        # Throttled stats to reduce sync
+        if (step_count % 50) == 0:
+            # Convert on CPU to avoid forcing an earlier sync
+            loss_cpu = float(loss.detach().cpu()) * accum  # scale back to per-batch
+            running_loss += loss_cpu
+            shown += 1
             bar.set_postfix(
-                loss=f"{running_loss / max(shown_steps,1):.4f}",
+                loss=f"{running_loss / max(shown,1):.4f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}"
             )
 
+        bar.update(1)
+
+    # Epoch-level scheduler step for schedulers expecting it (kept from your original)
     if (not isinstance(scheduler, OneCycleLR)) and hasattr(scheduler, "step") and not hasattr(scheduler, "step_update"):
         scheduler.step(epoch + 1)
-
 
 def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoader, epoch: int, device: torch.device) -> float:
     model_to_eval = ema.module if ema is not None else model

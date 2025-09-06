@@ -15,17 +15,18 @@ exp:
   device: cuda
   amp: true
   determinism: false
-  num_workers: 8
+  num_workers: 4
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
-  channels_last: false        # disabled to avoid .view() stride issues
+  channels_last: true        # disabled to avoid .view() stride issues
   torch_compile: false
 
 data:
   root: "ddr_binary_dataset/"
   img_sz: 600
-  cache_images: false
+  cache_images: true
+  cache_max_gb: 8.0
   balance_sampler: true
   batch_size: 5
   val_batch_size: 5
@@ -65,6 +66,7 @@ optim:
   beta1: 0.9
   beta2: 0.999
   grad_clip_norm: 1.0
+  grad_accum_steps: 2
 
 scheduler:
   type: "cosine"
