@@ -14,6 +14,10 @@ from omegaconf import DictConfig, OmegaConf
 from rich import traceback
 import json, hashlib  # add to imports
 from hydra import utils as hydra_utils
+import copy
+import optuna
+from optuna.trial import TrialState
+from omegaconf import open_dict
 
 import engine
 
@@ -60,6 +64,185 @@ def _device_from_cfg(cfg: DictConfig) -> torch.device:
         return torch.device("cuda")
     return torch.device("cpu")
 
+def _oc_update(cfg: DictConfig, dotted: str, value):
+    # OmegaConf.update supports dotted keys
+    OmegaConf.update(cfg, dotted, value, merge=True)
+
+# --- suggest params from cfg.hpo.params (list of {name,type,...}) ---
+def _apply_trial_to_cfg(trial: optuna.Trial, base_cfg: DictConfig) -> DictConfig:
+    """
+    Expects cfg.hpo.params like:
+      hpo:
+        params:
+          - {name: "optim.lr", type: "float", low: 1e-5, high: 1e-2, log: true}
+          - {name: "model.drop_rate", type: "float", low: 0.0, high: 0.5}
+          - {name: "optim.weight_decay", type: "float", low: 0.0, high: 0.1}
+          - {name: "scheduler.min_lr", type: "float", low: 1e-6, high: 1e-3, log: true}
+          - {name: "mixup_cutmix.mixup_alpha", type: "float", low: 0.0, high: 0.4}
+          - {name: "mixup_cutmix.cutmix_alpha", type: "float", low: 0.0, high: 0.4}
+          - {name: "data.batch_size", type: "categorical", choices: [16, 24, 32]}
+    """
+    cfg = copy.deepcopy(base_cfg)
+    params = getattr(cfg, "hpo", {}).get("params", [])
+    for p in params:
+        name = p["name"]
+        ptype = p["type"].lower()
+        if ptype == "float":
+            v = trial.suggest_float(name, float(p["low"]), float(p["high"]), log=bool(p.get("log", False)))
+        elif ptype == "int":
+            v = trial.suggest_int(name, int(p["low"]), int(p["high"]),
+                                  step=int(p.get("step", 1)), log=bool(p.get("log", False)))
+        elif ptype == "categorical":
+            v = trial.suggest_categorical(name, list(p["choices"]))
+        else:
+            raise ValueError(f"Unsupported hpo param type: {ptype} for {name}")
+        _oc_update(cfg, name, v)
+    return cfg
+
+def _build_sampler(sconf):
+    if not sconf:
+        return None
+    name = str(getattr(sconf, "name", "tpe")).lower()
+    seed = sconf.get("seed", None)
+    multivariate = bool(sconf.get("multivariate", False))
+    if name in ("tpe", "tpesampler"):
+        return optuna.samplers.TPESampler(seed=seed, multivariate=multivariate)
+    raise ValueError(f"Unsupported sampler: {name}")
+
+def _stop_on_failure_rate(threshold: float):
+    def _cb(study: optuna.Study, trial: optuna.trial.FrozenTrial):
+        done = [t for t in study.trials if t.state in (TrialState.COMPLETE, TrialState.FAIL, TrialState.PRUNED)]
+        if not done:
+            return
+        fails = sum(1 for t in done if t.state == TrialState.FAIL)
+        if fails / max(len(done), 1) > threshold:
+            study.stop()  # graceful stop
+    return _cb
+
+def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> float:
+    # logging/determinism/device
+    try:
+        logger.remove()
+    except Exception:
+        pass
+    _setup_logger_to_hydra_run_dir()
+    logger.info("CONFIG:\n" + OmegaConf.to_yaml(cfg))
+
+    engine.set_seed(cfg.exp.seed)
+    device = _device_from_cfg(cfg)
+    if cfg.exp.determinism:
+        torch.use_deterministic_algorithms(True)
+
+    # stable per-param checkpoint dir
+    _ensure_stable_checkpoint_dir(cfg)
+
+    # plumbing
+    (train_loader, val_loader, folds,
+     all_paths, targets, kornia_tf) = engine.build_dataloaders(cfg, device)
+
+    model, ema = engine.build_model(cfg, device)
+    criterion = engine.build_loss(cfg).to(device)
+    optimizer = engine.build_optimizer(cfg, model)
+    scheduler = engine.build_scheduler(cfg, optimizer, len(train_loader))
+    mixup_fn = engine.MixupCutmixScheduler(cfg)
+
+    start_epoch, start_fold, best_auc = engine.load_checkpoint(cfg, model, ema, optimizer, scheduler)
+    logger.info("Starting HPO trial" + (f" (resume at epoch {start_epoch})" if start_epoch > 0 else ""))
+
+    try:
+        for fold_idx, (tr_idx, val_idx) in enumerate(folds[start_fold:], start=start_fold):
+            train_loader = engine._make_loader(cfg, all_paths, targets, tr_idx, is_train=True)
+            val_loader   = engine._make_loader(cfg, all_paths, targets, val_idx, is_train=False)
+
+            epochs_no_improve = 0
+            local_best_auc = best_auc
+
+            for epoch in range(start_epoch, cfg.scheduler.t_initial):
+                # write resume marker BEFORE epoch
+                engine.write_resume_marker(cfg, epoch=epoch, fold_idx=fold_idx, best_auc=best_auc)
+
+                engine.train_one_epoch(
+                    cfg=cfg, model=model, ema=ema, criterion=criterion,
+                    optimizer=optimizer, scheduler=scheduler, loader=train_loader,
+                    epoch=epoch, device=device, kornia_tf=kornia_tf,
+                    mixup_fn=mixup_fn, stdscr=None
+                )
+
+                try:
+                    val_auc = engine.validate(cfg, model, ema, criterion, val_loader, epoch, device)
+                except FloatingPointError:
+                    val_auc = -1.0
+
+                best_auc = engine.save_checkpoint(
+                    cfg, model, ema, optimizer, scheduler,
+                    epoch=epoch, fold_idx=fold_idx, val_auc=val_auc, best_auc=best_auc
+                )
+
+                # epoch completed successfully; clear resume marker
+                engine.clear_resume_marker(cfg)
+
+                if val_auc > local_best_auc:
+                    local_best_auc = val_auc
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+
+                if epochs_no_improve >= cfg.early_stop.patience:
+                    logger.info(f"Early stopping after {epochs_no_improve} non-improving epochs.")
+                    break
+
+            start_epoch = 0  # next fold starts at 0
+
+    except Exception as e:
+        logger.error(f"Training error in HPO trial: {e}")
+        if rethrow_errors:
+            raise
+        return float("-inf")  # bad objective for maximize
+
+    return float(best_auc)
+
+# --- Optuna 4.x driver ---
+def run_hpo(cfg: DictConfig) -> float:
+    hcfg = cfg.hpo
+    sampler = _build_sampler(getattr(hcfg, "sampler", None))
+
+    study = optuna.create_study(
+        study_name=str(hcfg.study_name),
+        storage=str(hcfg.storage),
+        load_if_exists=True,
+        direction=str(hcfg.direction),
+        sampler=sampler,
+    )
+
+    callbacks = []
+    if getattr(hcfg, "max_failure_rate", None) is not None:
+        callbacks.append(_stop_on_failure_rate(float(hcfg.max_failure_rate)))
+
+    fail_on_error = bool(getattr(hcfg, "fail_on_error", True))
+
+    def objective(trial: optuna.Trial) -> float:
+        cfg_trial = _apply_trial_to_cfg(trial, cfg)
+        # Let errors mark the trial as FAIL if desired
+        if fail_on_error:
+            return run_training_nocurses(cfg_trial, rethrow_errors=True)
+        else:
+            return run_training_nocurses(cfg_trial, rethrow_errors=False)
+
+    study.optimize(objective, n_trials=int(hcfg.n_trials), n_jobs=int(hcfg.n_jobs),
+                   callbacks=callbacks)
+
+    best = study.best_trial
+    logger.info(f"Best trial AUC={best.value:.6f}; params={best.params}")
+
+    # persist a summary in Hydra run dir
+    out_dir = HydraConfig.get().runtime.output_dir if HydraConfig.initialized() else os.getcwd()
+    try:
+        with open(os.path.join(out_dir, "optuna_best.json"), "w") as f:
+            json.dump({"value": float(best.value), "params": best.params}, f, indent=2)
+    except Exception:
+        pass
+
+    return float(best.value)
 
 def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
     """
@@ -192,6 +375,13 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
 def main(cfg: DictConfig):
     if cfg.logging.rich_traceback:
         traceback.install()
+
+    # HPO path (Optuna 4.x)
+    if getattr(cfg, "hpo", None) and bool(getattr(cfg.hpo, "enable", False)):
+        best = run_hpo(cfg)
+        return best
+
+    # Single-run path (keeps your curses UI)
     best_auc = curses.wrapper(run_training, cfg)
     try:
         os.makedirs(cfg.checkpoint.dir, exist_ok=True)
