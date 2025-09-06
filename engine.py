@@ -27,7 +27,7 @@ import kornia.augmentation as K
 from tqdm import tqdm
 import json
 from collections import OrderedDict
-
+from torch.utils.data import get_worker_info
 
 # ───────────────────────────── utils ──────────────────────────────
 def set_seed(seed: int) -> None:
@@ -86,10 +86,11 @@ def clear_resume_marker(cfg) -> None:
 # ─────────────────────── Dataset & transforms ─────────────────────
 class AlbumentationsDataset(Dataset):
     """
-    Memory-safe pipeline with bounded cache:
-      - Cache stage: deterministic resize+pad to square (HWC uint8).
-      - Per-iteration stochastic crop happens on the cached image (keeps aug diversity).
-      - Cache is LRU-bounded by cfg.data.cache_max_gb to avoid RAM blow-ups.
+    Bounded, worker-aware cache:
+      - Caches deterministic resize+pad (HWC uint8) images.
+      - Random crop applied per fetch (keeps diversity).
+      - Total cache budget is divided across DataLoader workers, preventing RAM creep.
+      - Optional adaptive shrink if system RAM is near exhaustion (uses psutil if present).
     """
     class _LRU:
         def __init__(self, max_bytes: int):
@@ -97,25 +98,36 @@ class AlbumentationsDataset(Dataset):
             self.bytes = 0
             self.od = OrderedDict()  # idx -> np.ndarray
 
+        def _evict_to_fit(self):
+            while self.bytes > self.max_bytes and self.od:
+                k, v = self.od.popitem(last=False)
+                self.bytes -= int(v.nbytes)
+
         def get(self, idx: int):
             arr = self.od.pop(idx, None)
             if arr is not None:
-                self.od[idx] = arr  # move to back (MRU)
+                self.od[idx] = arr  # move to MRU
             return arr
 
         def put(self, idx: int, arr: np.ndarray):
             b = int(arr.nbytes)
             if b > self.max_bytes:
-                return  # item itself exceeds budget; skip caching
-            # Evict until fits
+                return
+            # remove existing entry cost, if any
+            prev = self.od.pop(idx, None)
+            if prev is not None:
+                self.bytes -= int(prev.nbytes)
+            # evict until it fits
             while self.bytes + b > self.max_bytes and self.od:
                 k, v = self.od.popitem(last=False)
                 self.bytes -= int(v.nbytes)
-            if idx in self.od:
-                self.bytes -= int(self.od[idx].nbytes)
-                self.od.pop(idx, None)
+            # insert
             self.od[idx] = arr
             self.bytes += b
+
+        def set_max_bytes(self, new_max: int):
+            self.max_bytes = int(new_max)
+            self._evict_to_fit()
 
         def __len__(self):
             return len(self.od)
@@ -125,7 +137,7 @@ class AlbumentationsDataset(Dataset):
         self.labels: List[int] = list(labels)
         self.cfg = cfg
 
-        # Deterministic stage to enable reusable cache (no randomness here).
+        # Deterministic stage for reusable cache
         self.tf_cache = A.Compose([
             A.LongestMaxSize(max_size=int(cfg.data.img_sz * 1.15)),
             A.PadIfNeeded(
@@ -134,17 +146,35 @@ class AlbumentationsDataset(Dataset):
                 border_mode=cv2.BORDER_REFLECT_101,
             ),
         ])
-        # Stochastic crop applied every __getitem__ (keeps randomness across epochs)
+        # Stochastic crop applied every fetch
         self.tf_crop = A.RandomCrop(cfg.data.img_sz, cfg.data.img_sz)
 
-        # Bounded LRU cache in system RAM (per worker)
+        # Cache controls
         self.enable_cache = bool(getattr(cfg.data, "cache_images", False))
-        max_gb = float(getattr(cfg.data, "cache_max_gb", 8.0))  # NEW: config knob
-        self._cache = self._LRU(max_bytes=int(max_gb * (1024 ** 3))) if self.enable_cache else None
+        self._cache = None
+        self._budget_adjusted = False  # set once inside worker
+
+        if self.enable_cache:
+            # Two modes:
+            #  - cache_max_is_total: treat 'cache_max_gb_total' as total across all workers
+            #  - else: legacy per-worker 'cache_max_gb'
+            is_total = bool(getattr(cfg.data, "cache_max_is_total", False))
+            if is_total:
+                total_gb = float(getattr(cfg.data, "cache_max_gb_total", 12.0))
+                init_bytes = int(total_gb * (1024 ** 3))  # divided later by num_workers
+            else:
+                per_gb = float(getattr(cfg.data, "cache_max_gb", 4.0))
+                init_bytes = int(per_gb * (1024 ** 3))
+            self._cache = self._LRU(max_bytes=init_bytes)
+
+        # Optional adaptive shrink thresholds (require psutil)
+        self._adaptive = True
+        self._high_frac = float(getattr(cfg.data, "cache_high_water_frac", 0.92))
+        self._low_frac  = float(getattr(cfg.data, "cache_low_water_frac", 0.86))
+        self._hit_count = 0
 
     @staticmethod
     def _read_img(path: str) -> np.ndarray:
-        # Suppress C-level libjpeg stderr (e.g., "Corrupt JPEG data: ...") during decode.
         import os, sys
         from contextlib import contextmanager
 
@@ -191,22 +221,54 @@ class AlbumentationsDataset(Dataset):
     def __len__(self) -> int:
         return len(self.paths)
 
-    def __getitem__(self, idx: int):
-        # Try cache (resized+pad stage)
-        if self._cache is not None:
-            cached = self._cache.get(idx)
-        else:
-            cached = None
+    def _adjust_budget_for_workers_if_needed(self):
+        if not self.enable_cache or self._budget_adjusted or self._cache is None:
+            return
+        info = get_worker_info()
+        # If in a worker and user requested total budget, divide it evenly
+        if info is not None and bool(getattr(self.cfg.data, "cache_max_is_total", False)):
+            per = max(1, int(info.num_workers))
+            new_bytes = max(16 * 1024 * 1024, self._cache.max_bytes // per)  # >=16MB
+            self._cache.set_max_bytes(new_bytes)
+        self._budget_adjusted = True
 
-        if cached is None:
-            img = self._read_img(self.paths[idx])  # HWC uint8 (original size)
-            base = self.tf_cache(image=img)["image"]  # HWC uint8, deterministic square
+    def _maybe_adaptive_shrink(self):
+        if not self.enable_cache or not self._adaptive or self._cache is None:
+            return
+        self._hit_count += 1
+        if (self._hit_count % 256) != 0:
+            return
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            used_frac = 1.0 - (vm.available / float(vm.total))
+            if used_frac >= self._high_frac:
+                # shrink toward low-water mark proportionally
+                target_used_frac = self._low_frac
+                shrink_ratio = max(0.5, (1.0 - target_used_frac) / (1.0 - used_frac + 1e-9))
+                new_max = int(self._cache.max_bytes * shrink_ratio)
+                if new_max < self._cache.max_bytes:
+                    self._cache.set_max_bytes(new_max)
+        except Exception:
+            # psutil not available or other issue; skip adaptive control
+            pass
+
+    def __getitem__(self, idx: int):
+        self._adjust_budget_for_workers_if_needed()
+        self._maybe_adaptive_shrink()
+
+        # Try cache (resized+pad stage)
+        base = None
+        if self._cache is not None:
+            base = self._cache.get(idx)
+
+        if base is None:
+            img = self._read_img(self.paths[idx])  # HWC uint8 original
+            base = self.tf_cache(image=img)["image"]  # deterministic square
             if self._cache is not None:
                 self._cache.put(idx, base)
-        else:
-            base = cached
 
-        # Per-sample stochastic crop on the cached base
+        # Per-sample stochastic crop
         cropped = self.tf_crop(image=base)["image"]  # HWC uint8
         x = torch.from_numpy(cropped).permute(2, 0, 1).contiguous()  # CHW uint8
         y = int(self.labels[idx])

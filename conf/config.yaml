@@ -26,7 +26,11 @@ data:
   root: "ddr_binary_dataset/"
   img_sz: 600
   cache_images: true
-  cache_max_gb: 8.0
+  cache_max_is_total: true      # NEW: interpret the budget as *global*
+  cache_max_gb_total: 24.0      # NEW: total across all workers (~⅓ of 47 GB)
+  # optional safety valves (only used if psutil is available)
+  cache_high_water_frac: 0.92   # start shrinking if RAM usage > 92%
+  cache_low_water_frac: 0.86    # shrink down toward this
   balance_sampler: true
   batch_size: 5
   val_batch_size: 5
