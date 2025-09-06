@@ -39,6 +39,8 @@ def _device_from_cfg(cfg: DictConfig) -> torch.device:
 def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
     """
     Curses-wrapped training entry. Clears the terminal at each epoch.
+    Resumable: writes a per-trial resume marker at the start of each epoch,
+    clears it upon successful completion, so mid-epoch exits resume precisely.
     """
     # ── Curses screen setup ────────────────────────────────────────────────
     stdscr.nodelay(True)
@@ -108,6 +110,9 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
                 update_line(1, fold_msg)
                 update_line(2, f"Epoch {epoch + 1}/{cfg.scheduler.t_initial} running (Fold {fold_idx + 1})...")
 
+                # Write per-trial resume marker BEFORE the epoch runs.
+                engine.write_resume_marker(cfg, epoch=epoch, fold_idx=fold_idx, best_auc=best_auc)
+
                 engine.train_one_epoch(
                     cfg=cfg, model=model, ema=ema, criterion=criterion,
                     optimizer=optimizer, scheduler=scheduler, loader=train_loader,
@@ -127,6 +132,9 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
                     epoch=epoch, fold_idx=fold_idx, val_auc=val_auc, best_auc=best_auc
                 )
 
+                # Epoch completed successfully; clear marker.
+                engine.clear_resume_marker(cfg)
+
                 if val_auc > local_best_auc:
                     local_best_auc = val_auc
                     epochs_no_improve = 0
@@ -139,13 +147,14 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
                     logger.info(msg)
                     break
 
-            start_epoch = 0
+            start_epoch = 0  # next fold restarts from epoch 0
 
     except Exception as e:
         logger.error(f"Training error: {e}")
         update_line(max_y - 2, f"ERROR: {e}. See train.log.")
         time.sleep(3)
-        raise
+        # Do not re-raise; allow the outer runner (e.g., Optuna) to mark the trial as finished/handled.
+        return best_auc
 
     return best_auc
 

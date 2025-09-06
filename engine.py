@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import timm
 import kornia.augmentation as K
 from tqdm import tqdm
+import json
 
 
 # ───────────────────────────── utils ──────────────────────────────
@@ -57,6 +58,40 @@ def _move_optimizer_state(optimizer: torch.optim.Optimizer, device: torch.device
         for k, v in list(state.items()):
             if torch.is_tensor(v):
                 state[k] = v.to(device, non_blocking=True)
+
+def _marker_path(cfg) -> str:
+    """Per-trial resume marker path."""
+    def _trial_suffix() -> str:
+        # Use Hydra run dir as a unique per-trial suffix when available.
+        try:
+            from hydra.core.hydra_config import HydraConfig
+            if HydraConfig.initialized():
+                run_dir = HydraConfig.get().runtime.output_dir
+                base = os.path.basename(str(run_dir).rstrip(os.sep))
+                return f"_{base}"
+        except Exception:
+            pass
+        return ""
+    os.makedirs(cfg.checkpoint.dir, exist_ok=True)
+    return os.path.join(cfg.checkpoint.dir, f"resume_marker{_trial_suffix()}.json")
+
+def write_resume_marker(cfg, epoch: int, fold_idx: int, best_auc: float) -> None:
+    """Record the epoch/fold we are ENTERING so a mid-epoch exit restarts here."""
+    os.makedirs(cfg.checkpoint.dir, exist_ok=True)
+    marker = {"epoch": int(epoch), "fold_idx": int(fold_idx), "best_auc": float(best_auc)}
+    tmp = _marker_path(cfg) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(marker, f)
+    os.replace(tmp, _marker_path(cfg))
+
+def clear_resume_marker(cfg) -> None:
+    """Clear marker after a successful epoch completes."""
+    try:
+        os.remove(_marker_path(cfg))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 # ─────────────────────── Dataset & transforms ─────────────────────
 class AlbumentationsDataset(Dataset):
@@ -792,23 +827,26 @@ def save_checkpoint(cfg, model, ema, optimizer, scheduler, epoch: int, fold_idx:
 def load_checkpoint(cfg, model, ema, optimizer, scheduler):
     """
     Robust resume:
-      - Supports the new light 'last.pth' (model+EMA only) plus optional 'last_heavy.pth'.
-      - Backward-compatible with legacy heavy 'last.pth' that already contains optimizer/scheduler.
-      - Also tolerates model-only files if user points resume at them (starts optimizers fresh).
+      - Supports light 'last.pth' (model+EMA) plus optional 'last_heavy.pth'.
+      - Backward-compatible with legacy heavy 'last.pth' containing optimizer/scheduler.
+      - Tolerates model-only files if user points resume at them (optimizers start fresh).
+      - Honors a per-trial resume marker to re-run the interrupted epoch precisely.
     """
     if str(cfg.checkpoint.resume) == "none":
+        clear_resume_marker(cfg)
         return 0, 0, -1.0
 
     base = (_ckpt_path(cfg, "last.pth") if str(cfg.checkpoint.resume) == "auto"
             else str(cfg.checkpoint.resume))
     if not os.path.isfile(base):
         logger.warning(f"Checkpoint not found at {base}, starting from scratch.")
+        clear_resume_marker(cfg)
         return 0, 0, -1.0
 
     try:
         state = torch.load(base, map_location="cpu")
 
-        # Load model weights (handle both dict-with-model and raw state_dict cases).
+        # Load model (dict-with-model or raw state_dict).
         if isinstance(state, dict) and "model" in state:
             model.load_state_dict(state["model"])
         else:
@@ -820,8 +858,7 @@ def load_checkpoint(cfg, model, ema, optimizer, scheduler):
             if ema_state is not None:
                 ema.load_state_dict(ema_state)
 
-        # Try to load optimizer/scheduler either from this file (legacy heavy last.pth)
-        # or from a separate heavy sidecar file.
+        # Try to load optimizer/scheduler either from this file (legacy) or sidecar heavy file.
         loaded_heavy = False
         if isinstance(state, dict) and state.get("optimizer") is not None:
             optimizer.load_state_dict(state["optimizer"])
@@ -837,11 +874,11 @@ def load_checkpoint(cfg, model, ema, optimizer, scheduler):
                     scheduler.load_state_dict(heavy["scheduler"])
                 loaded_heavy = True
 
-        # Harden param groups for AdamP edge-case (keeps compatibility across versions).
+        # Harden param groups for AdamP edge-case.
         for g in optimizer.param_groups:
             g.setdefault("nesterov", bool(getattr(cfg.optim, "nesterov", False)))
 
-        # Epoch/fold/best metadata if present; otherwise default.
+        # Epoch/fold/best metadata if present; otherwise defaults.
         epoch_in_state = (state.get("epoch") if isinstance(state, dict) else None)
         fold_in_state  = (state.get("fold_idx") if isinstance(state, dict) else None)
         best_in_state  = (state.get("best_auc") if isinstance(state, dict) else None)
@@ -850,10 +887,25 @@ def load_checkpoint(cfg, model, ema, optimizer, scheduler):
         start_fold  = int(fold_in_state if fold_in_state is not None else 0)
         best_auc    = float(best_in_state if best_in_state is not None else -1.0)
 
-        # If the checkpoint already completed the planned epochs, restart fresh.
+        # If a per-trial resume marker exists, prefer its precise coordinates.
+        try:
+            with open(_marker_path(cfg), "r") as f:
+                marker = json.load(f)
+            if isinstance(marker, dict):
+                if "epoch" in marker:
+                    start_epoch = int(marker["epoch"])
+                if "fold_idx" in marker:
+                    start_fold = int(marker["fold_idx"])
+                if "best_auc" in marker:
+                    best_auc = max(best_auc, float(marker["best_auc"]))
+        except Exception:
+            pass
+
+        # If plan already complete, consider training done; clear any stale marker.
         if start_epoch >= int(cfg.scheduler.t_initial):
-            logger.info("Checkpoint is at/after planned epochs; restarting fresh.")
-            return 0, 0, -1.0
+            logger.info("Checkpoint is at/after planned epochs; training considered complete.")
+            clear_resume_marker(cfg)
+            return start_epoch, start_fold, best_auc
 
         source = base if (isinstance(state, dict) and "model" in state) else "model-only file"
         extra  = " + heavy" if loaded_heavy else ""
@@ -863,4 +915,5 @@ def load_checkpoint(cfg, model, ema, optimizer, scheduler):
     except Exception as e:
         logger.error(f"Failed to load checkpoint from {base}: {e}")
         logger.warning("Starting from scratch.")
+        clear_resume_marker(cfg)
         return 0, 0, -1.0
