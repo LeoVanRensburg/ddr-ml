@@ -136,9 +136,18 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
     # stable per-param checkpoint dir
     _ensure_stable_checkpoint_dir(cfg)
 
-    # plumbing
-    (train_loader, val_loader, folds,
+    # data plumbing (folds + paths + kornia)
+    (train_loader_dummy, val_loader_dummy, folds,
      all_paths, targets, kornia_tf) = engine.build_dataloaders(cfg, device)
+
+    # shared epoch counters
+    tr_shared_epoch  = engine.create_shared_epoch(0)
+    val_shared_epoch = engine.create_shared_epoch(0)
+
+    # Initial loaders (first fold) for scheduler sizing
+    tr0, va0 = folds[0]
+    train_loader = engine._make_loader(cfg, all_paths, targets, tr0, is_train=True,  shared_epoch=tr_shared_epoch)
+    val_loader   = engine._make_loader(cfg, all_paths, targets, va0, is_train=False, shared_epoch=val_shared_epoch)
 
     model, ema = engine.build_model(cfg, device)
     criterion = engine.build_loss(cfg).to(device)
@@ -149,10 +158,13 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
     start_epoch, start_fold, best_auc = engine.load_checkpoint(cfg, model, ema, optimizer, scheduler)
     logger.info("Starting HPO trial" + (f" (resume at epoch {start_epoch})" if start_epoch > 0 else ""))
 
+    pause_path = os.path.join(cfg.checkpoint.dir, "PAUSE")
+
     try:
         for fold_idx, (tr_idx, val_idx) in enumerate(folds[start_fold:], start=start_fold):
-            train_loader = engine._make_loader(cfg, all_paths, targets, tr_idx, is_train=True)
-            val_loader   = engine._make_loader(cfg, all_paths, targets, val_idx, is_train=False)
+            # loaders for this fold (reuse shared epoch counters)
+            train_loader = engine._make_loader(cfg, all_paths, targets, tr_idx, is_train=True,  shared_epoch=tr_shared_epoch)
+            val_loader   = engine._make_loader(cfg, all_paths, targets, val_idx, is_train=False, shared_epoch=val_shared_epoch)
 
             epochs_no_improve = 0
             local_best_auc = best_auc
@@ -165,7 +177,7 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
                     cfg=cfg, model=model, ema=ema, criterion=criterion,
                     optimizer=optimizer, scheduler=scheduler, loader=train_loader,
                     epoch=epoch, device=device, kornia_tf=kornia_tf,
-                    mixup_fn=mixup_fn, stdscr=None
+                    mixup_fn=mixup_fn, stdscr=None, pause_file=pause_path
                 )
 
                 try:
@@ -180,6 +192,10 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
 
                 # epoch completed successfully; clear resume marker
                 engine.clear_resume_marker(cfg)
+
+                # bump shared epoch so workers drop caches for next epoch
+                engine.bump_shared_epoch(tr_shared_epoch)
+                engine.bump_shared_epoch(val_shared_epoch)
 
                 if val_auc > local_best_auc:
                     local_best_auc = val_auc
@@ -201,8 +217,13 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
 
     return float(best_auc)
 
+
 # --- Optuna 4.x driver ---
 def run_hpo(cfg: DictConfig) -> float:
+    # Force sequential HPO so curses can own the TTY per trial.
+    with open_dict(cfg.hpo):
+        cfg.hpo.n_jobs = 1
+
     hcfg = cfg.hpo
     sampler = _build_sampler(getattr(hcfg, "sampler", None))
 
@@ -221,20 +242,33 @@ def run_hpo(cfg: DictConfig) -> float:
     fail_on_error = bool(getattr(hcfg, "fail_on_error", True))
 
     def objective(trial: optuna.Trial) -> float:
+        # Apply trial params to a fresh config
         cfg_trial = _apply_trial_to_cfg(trial, cfg)
-        # Let errors mark the trial as FAIL if desired
-        if fail_on_error:
-            return run_training_nocurses(cfg_trial, rethrow_errors=True)
-        else:
-            return run_training_nocurses(cfg_trial, rethrow_errors=False)
 
-    study.optimize(objective, n_trials=int(hcfg.n_trials), n_jobs=int(hcfg.n_jobs),
-                   callbacks=callbacks)
+        # Compute a stable, param-hashed checkpoint dir now (also visible to user)
+        _ensure_stable_checkpoint_dir(cfg_trial)
+        trial.set_user_attr("ckpt_dir", cfg_trial.checkpoint.dir)
+        logger.info(f"[Trial {trial.number}] ckpt_dir={cfg_trial.checkpoint.dir}")
+
+        # Run this trial with curses so 'P' pause works.
+        # curses.wrapper handles terminal init/teardown even on exceptions.
+        try:
+            best_auc = curses.wrapper(run_training, cfg_trial)
+        except Exception:
+            if fail_on_error:
+                raise
+            logger.exception(f"[Trial {trial.number}] continuing after error; returning -inf")
+            return float("-inf")
+
+        return float(best_auc)
+
+    # Sequential optimize (n_jobs=1) so only one curses UI is active at a time.
+    study.optimize(objective, n_trials=int(hcfg.n_trials), n_jobs=1, callbacks=callbacks)
 
     best = study.best_trial
     logger.info(f"Best trial AUC={best.value:.6f}; params={best.params}")
 
-    # persist a summary in Hydra run dir
+    # Persist a summary in Hydra run dir
     out_dir = HydraConfig.get().runtime.output_dir if HydraConfig.initialized() else os.getcwd()
     try:
         with open(os.path.join(out_dir, "optuna_best.json"), "w") as f:
@@ -279,22 +313,32 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
     if cfg.exp.determinism:
         torch.use_deterministic_algorithms(True)
 
-    # ── Stable per-param checkpoint dir (Option B critical) ───────────────
+    # ── Stable per-param checkpoint dir ───────────────────────────────────
     _ensure_stable_checkpoint_dir(cfg)
 
     # ── Build data & model plumbing ───────────────────────────────────────
-    (train_loader, val_loader, folds,
+    (train_loader_dummy, val_loader_dummy, folds,
      all_paths, targets, kornia_tf) = engine.build_dataloaders(cfg, device)
+
+    # shared epoch counters
+    tr_shared_epoch  = engine.create_shared_epoch(0)
+    val_shared_epoch = engine.create_shared_epoch(0)
 
     model, ema = engine.build_model(cfg, device)
     criterion = engine.build_loss(cfg).to(device)
     optimizer = engine.build_optimizer(cfg, model)
+
+    # size scheduler on first fold
+    tr0, va0 = folds[0]
+    train_loader = engine._make_loader(cfg, all_paths, targets, tr0, is_train=True,  shared_epoch=tr_shared_epoch)
     scheduler = engine.build_scheduler(cfg, optimizer, len(train_loader))
     mixup_fn = engine.MixupCutmixScheduler(cfg)
 
     start_epoch, start_fold, best_auc = engine.load_checkpoint(
         cfg, model, ema, optimizer, scheduler
     )
+
+    pause_path = os.path.join(cfg.checkpoint.dir, "PAUSE")
 
     # Accurate, explicit status line about resumption.
     if start_epoch > 0 or os.path.isfile(engine._marker_path(cfg)):
@@ -312,8 +356,8 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
             update_line(1, fold_msg)
             logger.info(fold_msg)
 
-            train_loader = engine._make_loader(cfg, all_paths, targets, tr_idx, is_train=True)
-            val_loader   = engine._make_loader(cfg, all_paths, targets, val_idx, is_train=False)
+            train_loader = engine._make_loader(cfg, all_paths, targets, tr_idx, is_train=True,  shared_epoch=tr_shared_epoch)
+            val_loader   = engine._make_loader(cfg, all_paths, targets, val_idx, is_train=False, shared_epoch=val_shared_epoch)
 
             epochs_no_improve = 0
             local_best_auc = best_auc
@@ -330,7 +374,7 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
                     cfg=cfg, model=model, ema=ema, criterion=criterion,
                     optimizer=optimizer, scheduler=scheduler, loader=train_loader,
                     epoch=epoch, device=device, kornia_tf=kornia_tf,
-                    mixup_fn=mixup_fn, stdscr=stdscr
+                    mixup_fn=mixup_fn, stdscr=stdscr, pause_file=pause_path
                 )
 
                 try:
@@ -347,6 +391,10 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
 
                 # Epoch completed successfully; clear marker.
                 engine.clear_resume_marker(cfg)
+
+                # bump shared epoch so workers drop caches for next epoch
+                engine.bump_shared_epoch(tr_shared_epoch)
+                engine.bump_shared_epoch(val_shared_epoch)
 
                 if val_auc > local_best_auc:
                     local_best_auc = val_auc

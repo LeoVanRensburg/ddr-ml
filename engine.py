@@ -29,6 +29,9 @@ import json
 from collections import OrderedDict
 from torch.utils.data import get_worker_info
 
+from typing import List, Sequence, Optional  # replace your existing typing import
+import multiprocessing as mp
+
 # ───────────────────────────── utils ──────────────────────────────
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -83,6 +86,16 @@ def clear_resume_marker(cfg) -> None:
     except Exception:
         pass
 
+def create_shared_epoch(initial: int = 0):
+    """mp.Value shared across DataLoader workers; bump at epoch boundaries."""
+    return mp.Value('i', int(initial))
+
+def bump_shared_epoch(shared_epoch) -> None:
+    if shared_epoch is None:
+        return
+    with shared_epoch.get_lock():
+        shared_epoch.value += 1
+
 # ─────────────────────── Dataset & transforms ─────────────────────
 class AlbumentationsDataset(Dataset):
     """
@@ -132,7 +145,8 @@ class AlbumentationsDataset(Dataset):
         def __len__(self):
             return len(self.od)
 
-    def __init__(self, img_paths: Sequence[str], labels: Sequence[int], cfg):
+    def __init__(self, img_paths: Sequence[str], labels: Sequence[int], cfg,
+                 shared_epoch: Optional["mp.Value"]=None):
         self.paths: List[str] = list(img_paths)
         self.labels: List[int] = list(labels)
         self.cfg = cfg
@@ -172,6 +186,25 @@ class AlbumentationsDataset(Dataset):
         self._high_frac = float(getattr(cfg.data, "cache_high_water_frac", 0.92))
         self._low_frac  = float(getattr(cfg.data, "cache_low_water_frac", 0.86))
         self._hit_count = 0
+
+        # Epoch rollover control
+        self._shared_epoch = shared_epoch
+        self._last_seen_epoch = -1
+
+    def _maybe_epoch_rollover_clear(self):
+        """Hard-reset per-worker cache when shared epoch increments."""
+        if not self.enable_cache or self._cache is None or self._shared_epoch is None:
+            return
+        try:
+            cur = int(self._shared_epoch.value)
+        except Exception:
+            return
+        if cur != self._last_seen_epoch:
+            # Recreate LRU with same capacity and reset counters.
+            self._cache = self._LRU(max_bytes=self._cache.max_bytes)
+            self._hit_count = 0
+            self._last_seen_epoch = cur
+            gc.collect()
 
     @staticmethod
     def _read_img(path: str) -> np.ndarray:
@@ -256,6 +289,7 @@ class AlbumentationsDataset(Dataset):
     def __getitem__(self, idx: int):
         self._adjust_budget_for_workers_if_needed()
         self._maybe_adaptive_shrink()
+        self._maybe_epoch_rollover_clear()
 
         # Try cache (resized+pad stage)
         base = None
@@ -618,10 +652,10 @@ def _scan_dataset(cfg):
     return np.array(all_paths), np.array(targets)
 
 
-def _make_loader(cfg, paths, targets, indices, is_train: bool):
+def _make_loader(cfg, paths, targets, indices, is_train: bool, shared_epoch=None):
     subset_paths = [paths[i] for i in indices]
     subset_labels = [int(targets[i]) for i in indices]
-    ds = AlbumentationsDataset(subset_paths, subset_labels, cfg)
+    ds = AlbumentationsDataset(subset_paths, subset_labels, cfg, shared_epoch=shared_epoch)
 
     sampler, shuffle = None, is_train
     if is_train and cfg.data.balance_sampler:
@@ -715,6 +749,7 @@ def train_one_epoch(
     kornia_tf,
     mixup_fn: MixupCutmixScheduler,
     stdscr=None,
+    pause_file: Optional[str] = None,
 ) -> None:
     model.train()
     torch.cuda.synchronize() if device.type == "cuda" else None
@@ -744,6 +779,37 @@ def train_one_epoch(
 
     for (x, y) in prefetch:
         step_count += 1
+
+        # ── File-based pause (works without curses; used by HPO) ───────────
+        if pause_file:
+            try:
+                while os.path.isfile(pause_file):
+                    if not is_paused:
+                        is_paused = True
+                        try:
+                            if device.type == "cuda":
+                                optimizer.zero_grad(set_to_none=True)
+                                torch.cuda.synchronize()
+                                model.to("cpu")
+                                if ema is not None: ema.module.to("cpu")
+                                _move_optimizer_state(optimizer, torch.device("cpu"))
+                                torch.cuda.empty_cache()
+                                gc.collect()
+                                offloaded = True
+                        except Exception:
+                            pass
+                    time.sleep(0.25)
+                # resume
+                if is_paused:
+                    is_paused = False
+                    if offloaded:
+                        tgt = device
+                        model.to(tgt)
+                        if ema is not None: ema.module.to(tgt)
+                        _move_optimizer_state(optimizer, tgt)
+                        offloaded = False
+            except Exception:
+                pass
 
         # ── Pause toggle (curses UI) ─────────────────────────────────────
         if stdscr is not None:
@@ -836,7 +902,6 @@ def train_one_epoch(
 
         # Throttled stats to reduce sync
         if (step_count % 50) == 0:
-            # Convert on CPU to avoid forcing an earlier sync
             loss_cpu = float(loss.detach().cpu()) * accum  # scale back to per-batch
             running_loss += loss_cpu
             shown += 1
@@ -847,9 +912,10 @@ def train_one_epoch(
 
         bar.update(1)
 
-    # Epoch-level scheduler step for schedulers expecting it (kept from your original)
+    # Epoch-level scheduler step for schedulers expecting it
     if (not isinstance(scheduler, OneCycleLR)) and hasattr(scheduler, "step") and not hasattr(scheduler, "step_update"):
         scheduler.step(epoch + 1)
+
 
 def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoader, epoch: int, device: torch.device) -> float:
     model_to_eval = ema.module if ema is not None else model
