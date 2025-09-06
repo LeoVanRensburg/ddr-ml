@@ -7,3 +7,5 @@ __pycache__
 .DS_Store
 optunahpo.db
 multirun/
+checkpoints/
+optuna.db

@@ -12,9 +12,34 @@ from hydra.core.hydra_config import HydraConfig
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from rich import traceback
+import json, hashlib  # add to imports
+from hydra import utils as hydra_utils
 
 import engine
 
+def _param_hash_for_ckpt(cfg: DictConfig) -> str:
+    # Hash the resolved config minus volatile fields, to derive a stable dir per param set.
+    c = OmegaConf.to_container(cfg, resolve=True)
+    # Remove Hydra runtime section and the checkpoint.dir itself to avoid recursion.
+    c.pop("hydra", None)
+    if "checkpoint" in c and isinstance(c["checkpoint"], dict) and "dir" in c["checkpoint"]:
+        c["checkpoint"] = {k: v for k, v in c["checkpoint"].items() if k != "dir"}
+    blob = json.dumps(c, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(blob.encode()).hexdigest()[:12]
+
+def _ensure_stable_checkpoint_dir(cfg: DictConfig) -> None:
+    """
+    For Option B. Place checkpoints/marker under a dir that depends only on the params,
+    not on the Hydra run directory. This lets a re-enqueued trial pick them up.
+    """
+    # Base directory (project-root relative), configurable; default "checkpoints".
+    base = getattr(cfg.checkpoint, "base_dir", "checkpoints")
+    # Make absolute relative to original working directory (not Hydra's run dir).
+    base_abs = hydra_utils.to_absolute_path(base)
+    key = _param_hash_for_ckpt(cfg)
+    new_dir = os.path.join(base_abs, key)
+    os.makedirs(new_dir, exist_ok=True)
+    cfg.checkpoint.dir = new_dir
 
 def _setup_logger_to_hydra_run_dir():
     """Attach loguru sink to the current Hydra run directory if available."""
@@ -39,7 +64,7 @@ def _device_from_cfg(cfg: DictConfig) -> torch.device:
 def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
     """
     Curses-wrapped training entry. Clears the terminal at each epoch.
-    Resumable: writes a per-trial resume marker at the start of each epoch,
+    Resumable: writes a resume marker at the start of each epoch,
     clears it upon successful completion, so mid-epoch exits resume precisely.
     """
     # ── Curses screen setup ────────────────────────────────────────────────
@@ -71,6 +96,9 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
     if cfg.exp.determinism:
         torch.use_deterministic_algorithms(True)
 
+    # ── Stable per-param checkpoint dir (Option B critical) ───────────────
+    _ensure_stable_checkpoint_dir(cfg)
+
     # ── Build data & model plumbing ───────────────────────────────────────
     (train_loader, val_loader, folds,
      all_paths, targets, kornia_tf) = engine.build_dataloaders(cfg, device)
@@ -85,12 +113,16 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
         cfg, model, ema, optimizer, scheduler
     )
 
-    update_line(0, "Training started. Press 'P' to pause/resume.")
-    logger.info("Training started. Press 'P' in the active terminal to pause/resume.")
+    # Accurate, explicit status line about resumption.
+    if start_epoch > 0 or os.path.isfile(engine._marker_path(cfg)):
+        hdr = f"RESUMING at epoch {start_epoch + 1} / {cfg.scheduler.t_initial}, fold {start_fold + 1}."
+    else:
+        hdr = "Starting fresh."
+    update_line(0, f"{hdr} Press 'P' to pause/resume.")
+    logger.info(hdr + " Press 'P' to pause/resume.")
 
     try:
         for fold_idx, (tr_idx, val_idx) in enumerate(folds[start_fold:], start=start_fold):
-            # Clear screen at the start of each fold.
             stdscr.erase(); stdscr.refresh()
 
             fold_msg = f"===== Fold {fold_idx + 1}/{cfg.exp.folds} ====="
@@ -104,13 +136,11 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
             local_best_auc = best_auc
 
             for epoch in range(start_epoch, cfg.scheduler.t_initial):
-                # Clear terminal between epochs.
                 stdscr.erase(); stdscr.refresh()
-                update_line(0, "Training started. Press 'P' to pause/resume.")
+                update_line(0, f"Epoch {epoch + 1}/{cfg.scheduler.t_initial} running (Fold {fold_idx + 1}). Press 'P' to pause/resume.")
                 update_line(1, fold_msg)
-                update_line(2, f"Epoch {epoch + 1}/{cfg.scheduler.t_initial} running (Fold {fold_idx + 1})...")
 
-                # Write per-trial resume marker BEFORE the epoch runs.
+                # Write resume marker BEFORE the epoch runs.
                 engine.write_resume_marker(cfg, epoch=epoch, fold_idx=fold_idx, best_auc=best_auc)
 
                 engine.train_one_epoch(
@@ -153,7 +183,6 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
         logger.error(f"Training error: {e}")
         update_line(max_y - 2, f"ERROR: {e}. See train.log.")
         time.sleep(3)
-        # Do not re-raise; allow the outer runner (e.g., Optuna) to mark the trial as finished/handled.
         return best_auc
 
     return best_auc
@@ -163,7 +192,14 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
 def main(cfg: DictConfig):
     if cfg.logging.rich_traceback:
         traceback.install()
-    return curses.wrapper(run_training, cfg)
+    best_auc = curses.wrapper(run_training, cfg)
+    try:
+        os.makedirs(cfg.checkpoint.dir, exist_ok=True)
+        with open(os.path.join(cfg.checkpoint.dir, "result.json"), "w") as f:
+            json.dump({"best_auc": float(best_auc)}, f)
+    except Exception:
+        pass
+    return best_auc
 
 
 if __name__ == "__main__":

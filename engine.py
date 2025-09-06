@@ -49,6 +49,9 @@ def _cpu_state_dict(sd: dict) -> dict:
             out[k] = v
     return out
 
+def _ckpt_path(cfg, name: str) -> str:
+    return os.path.join(cfg.checkpoint.dir, name)
+
 def _move_optimizer_state(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
     """
     Move all optimizer state tensors to the target device.
@@ -60,23 +63,10 @@ def _move_optimizer_state(optimizer: torch.optim.Optimizer, device: torch.device
                 state[k] = v.to(device, non_blocking=True)
 
 def _marker_path(cfg) -> str:
-    """Per-trial resume marker path."""
-    def _trial_suffix() -> str:
-        # Use Hydra run dir as a unique per-trial suffix when available.
-        try:
-            from hydra.core.hydra_config import HydraConfig
-            if HydraConfig.initialized():
-                run_dir = HydraConfig.get().runtime.output_dir
-                base = os.path.basename(str(run_dir).rstrip(os.sep))
-                return f"_{base}"
-        except Exception:
-            pass
-        return ""
     os.makedirs(cfg.checkpoint.dir, exist_ok=True)
-    return os.path.join(cfg.checkpoint.dir, f"resume_marker{_trial_suffix()}.json")
+    return os.path.join(cfg.checkpoint.dir, "resume_marker.json")
 
 def write_resume_marker(cfg, epoch: int, fold_idx: int, best_auc: float) -> None:
-    """Record the epoch/fold we are ENTERING so a mid-epoch exit restarts here."""
     os.makedirs(cfg.checkpoint.dir, exist_ok=True)
     marker = {"epoch": int(epoch), "fold_idx": int(fold_idx), "best_auc": float(best_auc)}
     tmp = _marker_path(cfg) + ".tmp"
@@ -85,7 +75,6 @@ def write_resume_marker(cfg, epoch: int, fold_idx: int, best_auc: float) -> None
     os.replace(tmp, _marker_path(cfg))
 
 def clear_resume_marker(cfg) -> None:
-    """Clear marker after a successful epoch completes."""
     try:
         os.remove(_marker_path(cfg))
     except FileNotFoundError:
@@ -830,7 +819,7 @@ def load_checkpoint(cfg, model, ema, optimizer, scheduler):
       - Supports light 'last.pth' (model+EMA) plus optional 'last_heavy.pth'.
       - Backward-compatible with legacy heavy 'last.pth' containing optimizer/scheduler.
       - Tolerates model-only files if user points resume at them (optimizers start fresh).
-      - Honors a per-trial resume marker to re-run the interrupted epoch precisely.
+      - Honors a resume marker to re-run the interrupted epoch precisely.
     """
     if str(cfg.checkpoint.resume) == "none":
         clear_resume_marker(cfg)
@@ -887,7 +876,8 @@ def load_checkpoint(cfg, model, ema, optimizer, scheduler):
         start_fold  = int(fold_in_state if fold_in_state is not None else 0)
         best_auc    = float(best_in_state if best_in_state is not None else -1.0)
 
-        # If a per-trial resume marker exists, prefer its precise coordinates.
+        # If a resume marker exists, prefer its precise coordinates.
+        used_marker = False
         try:
             with open(_marker_path(cfg), "r") as f:
                 marker = json.load(f)
@@ -898,6 +888,7 @@ def load_checkpoint(cfg, model, ema, optimizer, scheduler):
                     start_fold = int(marker["fold_idx"])
                 if "best_auc" in marker:
                     best_auc = max(best_auc, float(marker["best_auc"]))
+                used_marker = True
         except Exception:
             pass
 
@@ -909,7 +900,10 @@ def load_checkpoint(cfg, model, ema, optimizer, scheduler):
 
         source = base if (isinstance(state, dict) and "model" in state) else "model-only file"
         extra  = " + heavy" if loaded_heavy else ""
-        logger.info(f"Resumed from {source}{extra} (epoch {start_epoch}, fold {start_fold + 1})")
+        if used_marker:
+            logger.info(f"Resumed from {source}{extra} (RE-RUN epoch {start_epoch + 1}, fold {start_fold + 1}) via marker.")
+        else:
+            logger.info(f"Resumed from {source}{extra} (epoch {start_epoch}, fold {start_fold + 1}) based on checkpoint metadata.")
         return start_epoch, start_fold, best_auc
 
     except Exception as e:
