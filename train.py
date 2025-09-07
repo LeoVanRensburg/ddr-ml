@@ -436,6 +436,17 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
         update_line(max_y - 2, f"ERROR: {e}. See train.log.")
         time.sleep(3)
         return best_auc
+    finally:
+        # Final guard: ensure allocator is drained before returning control
+        try:
+            if _device_from_cfg(cfg).type == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        import gc as _gc
+        _gc.collect()
+        engine._malloc_trim()
 
     return best_auc
 

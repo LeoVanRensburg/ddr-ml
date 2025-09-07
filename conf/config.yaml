@@ -62,6 +62,7 @@ model:
 ema:
   enable: true
   decay: 0.9998
+  device: cuda
 
 optim:
   type: "adamp"
