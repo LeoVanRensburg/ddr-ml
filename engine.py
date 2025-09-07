@@ -109,6 +109,19 @@ def bump_shared_epoch(shared_epoch) -> None:
     with shared_epoch.get_lock():
         shared_epoch.value += 1
 
+def _channels_last_allowed(cfg) -> bool:
+    """
+    Return True iff channels_last was requested and optimizer is not AdamP.
+    """
+    try:
+        req = bool(getattr(cfg.exp, "channels_last", False))
+        opt = str(getattr(cfg.optim, "type", "")).lower()
+        if "adamp" in opt:
+            return False
+        return req
+    except Exception:
+        return False
+
 # ─────────────────────── Dataset & transforms ─────────────────────
 class AlbumentationsDataset(Dataset):
     """
@@ -562,11 +575,15 @@ def build_model(cfg, device: torch.device):
         pass
 
     # Optional memory format for conv-heavy nets
-    if bool(getattr(cfg.exp, "channels_last", False)):
+    if _channels_last_allowed(cfg):
         try:
             model.to(memory_format=torch.channels_last)
         except Exception:
             logger.warning("channels_last requested but not supported by the model; continuing.")
+    else:
+        # If user requested channels_last but we disabled it due to AdamP, make it explicit.
+        if bool(getattr(cfg.exp, "channels_last", False)) and "adamp" in str(getattr(cfg.optim, "type", "")).lower():
+            logger.warning("channels_last requested, but automatically disabled for AdamP to avoid stride/view issues.")
 
     # Optional compile (PyTorch 2.x)
     if bool(getattr(cfg.exp, "torch_compile", False)):
@@ -833,7 +850,7 @@ def train_one_epoch(
     # Overlap H2D + GPU aug with compute
     prefetch = CUDAPrefetcher(
         loader, device, kornia_tf,
-        channels_last=bool(getattr(cfg.exp, "channels_last", False))
+        channels_last=_channels_last_allowed(cfg)  # ← auto-disable for AdamP
     )
 
     is_paused = False
@@ -1043,7 +1060,7 @@ def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoade
     if device.type == "cuda":
         prefetch = CUDAPrefetcher(
             loader, device, norm_tf,
-            channels_last=bool(getattr(cfg.exp, "channels_last", False))
+            channels_last=_channels_last_allowed(cfg)  # ← auto-disable for AdamP
         )
         iterator = iter(prefetch)
         next_batch = lambda: next(iterator, None)
@@ -1060,7 +1077,7 @@ def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoade
             x = x.float().div_(255.0)
             x = (x - mean) / std
             x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).contiguous()
-            if bool(getattr(cfg.exp, "channels_last", False)):
+            if _channels_last_allowed(cfg):  # ← auto-disable for AdamP
                 x = x.to(memory_format=torch.channels_last)
             return (x, y)
 
