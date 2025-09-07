@@ -18,6 +18,7 @@ import copy
 import optuna
 from optuna.trial import TrialState
 from omegaconf import open_dict
+import pathlib
 
 import engine
 
@@ -57,6 +58,26 @@ def _setup_logger_to_hydra_run_dir():
             diagnose=False,
         )
 
+def _normalize_storage_uri(storage: str, base_ckpt_dir: str) -> str:
+    """
+    Ensure Optuna storage persists across runs.
+    - If empty/None -> create sqlite DB under checkpoint.base_dir.
+    - If sqlite:///relative/path.db -> absolutize relative path and ensure parent dir exists.
+    - Otherwise (e.g., postgres/mysql URIs) pass through unchanged.
+    """
+    s = (storage or "").strip()
+    if s.lower() in ("", "none", "null"):
+        base_abs = os.path.abspath(hydra_utils.to_absolute_path(base_ckpt_dir))
+        os.makedirs(base_abs, exist_ok=True)
+        return "sqlite:///" + os.path.join(base_abs, "optuna.db")
+
+    if s.startswith("sqlite:///"):
+        raw = s[len("sqlite:///"):]
+        abs_path = os.path.abspath(hydra_utils.to_absolute_path(raw))
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        return "sqlite:///" + abs_path
+
+    return s
 
 def _device_from_cfg(cfg: DictConfig) -> torch.device:
     want = str(cfg.exp.device).lower()
@@ -221,71 +242,91 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
 # --- Optuna 4.x driver ---
 def run_hpo(cfg: DictConfig) -> float:
     # Force sequential HPO so curses can own the TTY per trial.
-    from omegaconf import open_dict  # local import to keep this method self-contained
+    from omegaconf import open_dict  # keep local to avoid import side-effects
     with open_dict(cfg.hpo):
         cfg.hpo.n_jobs = 1
 
     hcfg = cfg.hpo
     sampler = _build_sampler(getattr(hcfg, "sampler", None))
+    fail_on_error = bool(getattr(hcfg, "fail_on_error", True))
+
+    # Normalize storage so trials persist across separate program launches.
+    base_ckpt_dir = getattr(cfg.checkpoint, "base_dir", "checkpoints")
+    storage_uri = _normalize_storage_uri(str(getattr(hcfg, "storage", "")), base_ckpt_dir)
 
     study = optuna.create_study(
         study_name=str(hcfg.study_name),
-        storage=str(hcfg.storage),
+        storage=storage_uri,
         load_if_exists=True,
         direction=str(hcfg.direction),
         sampler=sampler,
     )
 
+    # Optional: clean up checkpoints only for COMPLETED trials.
+    def _cleanup_ckpt_on_complete(enabled: bool):
+        def _cb(study_: optuna.Study, t: optuna.trial.FrozenTrial):
+            if not enabled:
+                return
+            from optuna.trial import TrialState as _TS
+            if t.state == _TS.COMPLETE:
+                ckpt_dir_ = t.user_attrs.get("ckpt_dir")
+                if ckpt_dir_:
+                    try:
+                        import shutil
+                        shutil.rmtree(ckpt_dir_, ignore_errors=True)
+                        logger.info(f"[Trial {t.number}] cleaned checkpoint dir: {ckpt_dir_}")
+                    except Exception as e:
+                        logger.warning(f"[Trial {t.number}] checkpoint cleanup failed: {e}")
+        return _cb
+
     callbacks = []
     if getattr(hcfg, "max_failure_rate", None) is not None:
         callbacks.append(_stop_on_failure_rate(float(hcfg.max_failure_rate)))
+    callbacks.append(_cleanup_ckpt_on_complete(bool(getattr(hcfg, "cleanup_on_complete", False))))
 
-    fail_on_error = bool(getattr(hcfg, "fail_on_error", True))
+    # Enqueue the most recent unfinished trial's params (to resume next).
+    try:
+        from optuna.trial import TrialState as TS
+        unfinished = [t for t in study.get_trials(deepcopy=False)
+                      if t.state in (TS.RUNNING, TS.FAIL, TS.PRUNED)]
+        for t in sorted(unfinished, key=lambda x: x.number, reverse=True):
+            ckpt_dir = t.user_attrs.get("ckpt_dir")
+            if not ckpt_dir:
+                continue
+            marker = os.path.join(ckpt_dir, "resume_marker.json")
+            lastpth = os.path.join(ckpt_dir, "last.pth")
+            if os.path.isfile(marker) or os.path.isfile(lastpth):
+                logger.info(f"Enqueuing params from unfinished trial {t.number} for resume.")
+                study.enqueue_trial(t.params)
+                break
+    except Exception as e:
+        logger.warning(f"Resume enqueue skipped due to error: {e}")
 
     def objective(trial: optuna.Trial) -> float:
         # Apply trial params to a fresh config
         cfg_trial = _apply_trial_to_cfg(trial, cfg)
 
-        # Compute a stable, param-hashed checkpoint dir now (also visible to user)
+        # Compute stable, param-hashed checkpoint dir now (visible + persistent)
         _ensure_stable_checkpoint_dir(cfg_trial)
         ckpt_dir = cfg_trial.checkpoint.dir
         trial.set_user_attr("ckpt_dir", ckpt_dir)
         logger.info(f"[Trial {trial.number}] ckpt_dir={ckpt_dir}")
 
-        best_auc: float
         try:
-            # Run this trial with curses so 'P' pause works.
-            # curses.wrapper handles terminal init/teardown even on exceptions.
+            # Run with curses so 'P' pause works; engine handles epoch-level resume.
             best_auc = curses.wrapper(run_training, cfg_trial)
             return float(best_auc)
+        except KeyboardInterrupt:
+            # Mark interruption; keep ckpt for precise resume on next launch.
+            trial.set_user_attr("interrupted", True)
+            raise
         except Exception:
             if fail_on_error:
-                # Ensure cleanup still runs via finally; then re-raise.
                 raise
             logger.exception(f"[Trial {trial.number}] continuing after error; returning -inf")
             return float("-inf")
-        finally:
-            # ── Cleanup per-trial checkpoint directory to prevent disk creep ──
-            try:
-                import os, shutil
-                # Only delete if the path is inside the configured base_dir
-                base = getattr(cfg_trial.checkpoint, "base_dir", "checkpoints")
-                base_abs = os.path.abspath(hydra_utils.to_absolute_path(base))
-                ckpt_abs = os.path.abspath(ckpt_dir)
 
-                # Add os.sep to avoid prefix collisions (e.g., /foo/bar and /foo/barley)
-                if ckpt_abs.startswith(base_abs + os.sep):
-                    shutil.rmtree(ckpt_abs, ignore_errors=True)
-                    logger.info(f"[Trial {trial.number}] cleaned checkpoint dir: {ckpt_abs}")
-                else:
-                    logger.warning(
-                        f"[Trial {trial.number}] skip cleanup; ckpt outside base_dir "
-                        f"(ckpt={ckpt_abs}, base={base_abs})"
-                    )
-            except Exception as e:
-                logger.warning(f"[Trial {trial.number}] checkpoint cleanup failed: {e}")
-
-    # Sequential optimize (n_jobs=1) so only one curses UI is active at a time.
+    # Let KeyboardInterrupt propagate (so the program stops immediately and leaves artifacts intact).
     study.optimize(objective, n_trials=int(hcfg.n_trials), n_jobs=1, callbacks=callbacks)
 
     best = study.best_trial
