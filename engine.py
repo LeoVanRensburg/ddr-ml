@@ -78,6 +78,19 @@ def write_resume_marker(cfg, epoch: int, fold_idx: int, best_auc: float) -> None
         json.dump(marker, f)
     os.replace(tmp, _marker_path(cfg))
 
+def _malloc_trim():
+    """
+    Return freed heap pages to the OS (glibc on Linux).
+    On WSL2 this helps RSS drop so Windows can reclaim memory from the VM.
+    No-op on non-glibc platforms.
+    """
+    try:
+        import ctypes, sys
+        if sys.platform.startswith("linux"):
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
 def clear_resume_marker(cfg) -> None:
     try:
         os.remove(_marker_path(cfg))
@@ -343,12 +356,19 @@ class CUDAPrefetcher:
     """
     Overlaps H2D copies and GPU augment/normalize with compute via a side CUDA stream.
     Produces device tensors already normalized (through kornia_tf).
+
+    Pausing behavior:
+      - If DataLoader.persistent_workers == True: never shut down its iterator/workers.
+        Only drop our staged batch and release references; then re-prime on resume.
+      - If persistent_workers == False: fully tear down iterator so CPU RAM/pinned pages are freed.
     """
     def __init__(self, loader: DataLoader, device: torch.device, kornia_tf, channels_last: bool = False):
+        self.loader = loader
         self.loader_iter = iter(loader)
         self.device = device
         self.kornia_tf = kornia_tf
         self.channels_last = bool(channels_last)
+        self.persistent = bool(getattr(loader, "persistent_workers", False))
         self.stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.next_batch = None
         self._preload()
@@ -361,7 +381,6 @@ class CUDAPrefetcher:
             return
 
         if self.stream is None:
-            # CPU or non-CUDA device path – keep behavior consistent.
             x = x.to(self.device, non_blocking=True).float().div_(255.0)
             y = y.to(self.device, non_blocking=True)
             x = self.kornia_tf(x)
@@ -371,7 +390,6 @@ class CUDAPrefetcher:
             self.next_batch = (x, y)
             return
 
-        # CUDA path: stage work on the copy/aug stream.
         with torch.cuda.stream(self.stream):
             x = x.to(self.device, non_blocking=True).float().div_(255.0)
             y = y.to(self.device, non_blocking=True)
@@ -390,12 +408,51 @@ class CUDAPrefetcher:
         if self.stream is not None:
             torch.cuda.current_stream().wait_stream(self.stream)
         x, y = self.next_batch
-        # Ensure lifetime of the tensors on the current stream.
         if hasattr(x, "record_stream"):
             x.record_stream(torch.cuda.current_stream())
             y.record_stream(torch.cuda.current_stream())
         self._preload()
         return x, y
+
+    def close(self):
+        """
+        Pause hook.
+        - Persistent workers: DO NOT touch the underlying iterator/queues. Only drop staged batch.
+        - Non-persistent: shut down the iterator so OS can reclaim RAM/pinned pages.
+        """
+        # Drop staged batch and our references.
+        self.next_batch = None
+        self.loader_iter = None
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        _malloc_trim()
+
+        # Only for non-persistent workers: tear down the loader's iterator/queues.
+        if not self.persistent:
+            try:
+                it = getattr(self.loader, "_iterator", None)
+                if it is not None and hasattr(it, "_shutdown_workers"):
+                    it._shutdown_workers()
+                # Let DataLoader rebuild a fresh iterator later.
+                if hasattr(self.loader, "_iterator"):
+                    self.loader._iterator = None
+            except Exception:
+                pass
+            gc.collect()
+            _malloc_trim()
+
+    def reopen(self):
+        """
+        Resume hook.
+        - Persistent workers: reuse the existing iterator object held by DataLoader.
+        - Non-persistent: a fresh iterator/workers are created.
+        """
+        self.loader_iter = iter(self.loader)
+        self._preload()
+
 # ───────────────────── loss variants ───────────────────────────────
 class AsymmetricLoss(nn.Module):
     """
@@ -752,14 +809,18 @@ def train_one_epoch(
     pause_file: Optional[str] = None,
 ) -> None:
     model.train()
-    torch.cuda.synchronize() if device.type == "cuda" else None
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
     num_steps = len(loader)
     scaler = torch.amp.GradScaler(enabled=cfg.exp.amp, growth_interval=15000)
     accum = int(getattr(cfg.optim, "grad_accum_steps", 1) or 1)
 
-    # Prefetcher overlaps H2D + GPU aug with compute
-    prefetch = CUDAPrefetcher(loader, device, kornia_tf, channels_last=bool(getattr(cfg.exp, "channels_last", False)))
+    # Overlap H2D + GPU aug with compute
+    prefetch = CUDAPrefetcher(
+        loader, device, kornia_tf,
+        channels_last=bool(getattr(cfg.exp, "channels_last", False))
+    )
 
     is_paused = False
     offloaded = False
@@ -773,28 +834,33 @@ def train_one_epoch(
 
     running_loss = 0.0
     shown = 0
-    step_count = 0  # counts batches consumed
+    step_count = 0
 
     optimizer.zero_grad(set_to_none=True)
 
     for (x, y) in prefetch:
         step_count += 1
 
-        # ── File-based pause (works without curses; used by HPO) ───────────
+        # ── File-based pause (e.g., created by external controller) ─────────
         if pause_file:
             try:
                 while os.path.isfile(pause_file):
                     if not is_paused:
                         is_paused = True
                         try:
+                            # Release staged batch; with persistent workers this preserves iterator/queues.
+                            prefetch.close()
+
                             if device.type == "cuda":
                                 optimizer.zero_grad(set_to_none=True)
                                 torch.cuda.synchronize()
                                 model.to("cpu")
-                                if ema is not None: ema.module.to("cpu")
+                                if ema is not None:
+                                    ema.module.to("cpu")
                                 _move_optimizer_state(optimizer, torch.device("cpu"))
                                 torch.cuda.empty_cache()
                                 gc.collect()
+                                _malloc_trim()
                                 offloaded = True
                         except Exception:
                             pass
@@ -805,34 +871,47 @@ def train_one_epoch(
                     if offloaded:
                         tgt = device
                         model.to(tgt)
-                        if ema is not None: ema.module.to(tgt)
+                        if ema is not None:
+                            ema.module.to(tgt)
                         _move_optimizer_state(optimizer, tgt)
                         offloaded = False
+                    try:
+                        prefetch.reopen()
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-        # ── Pause toggle (curses UI) ─────────────────────────────────────
+        # ── Interactive pause (curses UI, 'P' toggle) ───────────────────────
         if stdscr is not None:
             key = stdscr.getch()
             if key in (ord("p"), ord("P")):
                 is_paused = not is_paused
                 if is_paused:
-                    try: bar.clear(nolock=True)
-                    except Exception: pass
+                    try:
+                        bar.clear(nolock=True)
+                    except Exception:
+                        pass
+                    try:
+                        prefetch.close()
+                    except Exception:
+                        pass
                     try:
                         if device.type == "cuda":
                             optimizer.zero_grad(set_to_none=True)
                             torch.cuda.synchronize()
                             model.to("cpu")
-                            if ema is not None: ema.module.to("cpu")
+                            if ema is not None:
+                                ema.module.to("cpu")
                             _move_optimizer_state(optimizer, torch.device("cpu"))
                             torch.cuda.empty_cache()
                             gc.collect()
+                            _malloc_trim()
                             offloaded = True
                     except Exception:
                         pass
                     try:
-                        stdscr.addstr(0, 0, "[PAUSED] VRAM freed. Press 'P' to resume...".ljust(120))
+                        stdscr.addstr(0, 0, "[PAUSED] VRAM freed; worker state preserved. Press 'P' to resume...".ljust(120))
                         stdscr.refresh()
                     except Exception:
                         pass
@@ -845,9 +924,14 @@ def train_one_epoch(
                         if offloaded:
                             tgt = device
                             model.to(tgt)
-                            if ema is not None: ema.module.to(tgt)
+                            if ema is not None:
+                                ema.module.to(tgt)
                             _move_optimizer_state(optimizer, tgt)
                             offloaded = False
+                    except Exception:
+                        pass
+                    try:
+                        prefetch.reopen()
                     except Exception:
                         pass
                     try:
@@ -859,14 +943,14 @@ def train_one_epoch(
                     except Exception:
                         pass
 
-        # Mixup/Cutmix after normalization (GPU)
+        # ── Forward/Backward ────────────────────────────────────────────────
         epoch_frac = (epoch + step_count / max(num_steps, 1)) / max(cfg.scheduler.t_initial, 1)
         x, y_a, y_b, lam = mixup_fn(x, y, epoch_frac)
         x = x.contiguous()
 
         with torch.autocast(device_type=_autocast_device(device), enabled=cfg.exp.amp):
             if cfg.exp.amp:
-                x.add_(torch.randn_like(x), alpha=1e-6)  # tiny noise for AMP stability
+                x.add_(torch.randn_like(x), alpha=1e-6)
 
             logits = model(x)
             logits.clamp_(-15.0, 15.0)
@@ -875,7 +959,6 @@ def train_one_epoch(
             loss = lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
             loss = loss / accum
 
-        # Skip non-finite loss (rare)
         if not torch.isfinite(loss):
             logger.warning(f"Non-finite loss at epoch {epoch + 1} step {step_count}; batch skipped.")
             optimizer.zero_grad(set_to_none=True)
@@ -884,38 +967,33 @@ def train_one_epoch(
 
         scaler.scale(loss).backward()
 
-        # Unscale once per (accum) and clip
         if (step_count % accum) == 0:
             scaler.unscale_(optimizer)
             if cfg.optim.grad_clip_norm:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip_norm)
-
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        # Per-batch scheduler step/update (works with CosineLRScheduler/OneCycleLR)
         _scheduler_step_per_batch(scheduler, epoch, step_count, num_steps)
 
         if ema is not None:
             ema.update(model)
 
-        # Throttled stats to reduce sync
         if (step_count % 50) == 0:
-            loss_cpu = float(loss.detach().cpu()) * accum  # scale back to per-batch
+            loss_cpu = float(loss.detach().cpu()) * accum
             running_loss += loss_cpu
             shown += 1
             bar.set_postfix(
-                loss=f"{running_loss / max(shown,1):.4f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.2e}"
+                loss=f"{running_loss / max(shown, 1):.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
 
         bar.update(1)
 
-    # Epoch-level scheduler step for schedulers expecting it
+    # Epoch-level step for schedulers that expect it
     if (not isinstance(scheduler, OneCycleLR)) and hasattr(scheduler, "step") and not hasattr(scheduler, "step_update"):
         scheduler.step(epoch + 1)
-
 
 def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoader, epoch: int, device: torch.device) -> float:
     model_to_eval = ema.module if ema is not None else model
