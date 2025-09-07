@@ -1002,15 +1002,44 @@ def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoade
     loss_meter = 0.0
     preds, gts = [], []
 
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).reshape(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).reshape(1, 3, 1, 1)
+    # ---- NEW: use CUDAPrefetcher with normalize-only pipeline
+    norm_tf = K.AugmentationSequential(
+        K.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        data_keys=["input"], same_on_batch=False,
+    )
 
-    with torch.no_grad():
-        for x, y in loader:
+    if device.type == "cuda":
+        prefetch = CUDAPrefetcher(
+            loader, device, norm_tf,
+            channels_last=bool(getattr(cfg.exp, "channels_last", False))
+        )
+        iterator = iter(prefetch)
+        next_batch = lambda: next(iterator, None)
+    else:
+        # CPU fallback path (no prefetcher)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).reshape(1, 3, 1, 1)
+        std  = torch.tensor([0.229, 0.224, 0.225], device=device).reshape(1, 3, 1, 1)
+        iterator = iter(loader)
+        def next_batch():
+            try:
+                x, y = next(iterator)
+            except StopIteration:
+                return None
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             x = x.float().div_(255.0)
             x = (x - mean) / std
             x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).contiguous()
+            if bool(getattr(cfg.exp, "channels_last", False)):
+                x = x.to(memory_format=torch.channels_last)
+            return (x, y)
+
+    # ---- inference loop
+    with torch.inference_mode():  # faster than no_grad for val
+        while True:
+            batch = next_batch()
+            if batch is None:
+                break
+            x, y = batch
 
             with torch.autocast(device_type=_autocast_device(device), enabled=cfg.exp.amp):
                 logits = model_to_eval(x)
@@ -1023,14 +1052,10 @@ def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoade
 
             loss_meter += float(loss.detach().cpu().item())
 
-            # Probability extraction:
-            # - If multi-class (C>=2), use softmax and take class-1 probability (binary AUC convention).
-            # - If single-logit, use sigmoid.
             if logits.ndim == 2 and logits.size(1) >= 2:
                 prob = torch.softmax(logits, dim=1)[:, 1]
             else:
                 prob = torch.sigmoid(logits.squeeze(-1))
-
             prob = torch.nan_to_num(prob, nan=0.5, posinf=1.0, neginf=0.0)
 
             preds.append(prob.float().cpu().numpy())
@@ -1040,9 +1065,7 @@ def validate(cfg, model: nn.Module, ema, criterion: nn.Module, loader: DataLoade
         logger.warning("No valid validation batches; returning AUC=0.5")
         return 0.5
 
-    preds = np.concatenate(preds)
-    gts = np.concatenate(gts)
-
+    preds = np.concatenate(preds); gts = np.concatenate(gts)
     try:
         auc = roc_auc_score(gts, preds)
     except Exception:

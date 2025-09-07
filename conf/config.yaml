@@ -15,10 +15,10 @@ exp:
   device: cuda
   amp: true
   determinism: false
-  num_workers: 4
+  num_workers: 8
   pin_memory: true
   persistent_workers: false
-  prefetch_factor: 2
+  prefetch_factor: 6
   channels_last: true        # disabled to avoid .view() stride issues
   torch_compile: false
 
@@ -33,7 +33,7 @@ data:
   cache_low_water_frac: 0.86    # shrink down toward this
   balance_sampler: true
   batch_size: 5
-  val_batch_size: 5
+  val_batch_size: 10
   test_dir: "ddr_binary_dataset/test"
   aug_cpu:
     horizontal_flip: 0.5

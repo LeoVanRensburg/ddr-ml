@@ -140,14 +140,13 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
     (train_loader_dummy, val_loader_dummy, folds,
      all_paths, targets, kornia_tf) = engine.build_dataloaders(cfg, device)
 
-    # shared epoch counters
-    tr_shared_epoch  = engine.create_shared_epoch(0)
-    val_shared_epoch = engine.create_shared_epoch(0)
+    # shared epoch counter ONLY for training; validation stays cache-warm across epochs
+    tr_shared_epoch = engine.create_shared_epoch(0)
 
     # Initial loaders (first fold) for scheduler sizing
     tr0, va0 = folds[0]
     train_loader = engine._make_loader(cfg, all_paths, targets, tr0, is_train=True,  shared_epoch=tr_shared_epoch)
-    val_loader   = engine._make_loader(cfg, all_paths, targets, va0, is_train=False, shared_epoch=val_shared_epoch)
+    val_loader   = engine._make_loader(cfg, all_paths, targets, va0, is_train=False, shared_epoch=None)
 
     model, ema = engine.build_model(cfg, device)
     criterion = engine.build_loss(cfg).to(device)
@@ -162,9 +161,9 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
 
     try:
         for fold_idx, (tr_idx, val_idx) in enumerate(folds[start_fold:], start=start_fold):
-            # loaders for this fold (reuse shared epoch counters)
+            # loaders for this fold
             train_loader = engine._make_loader(cfg, all_paths, targets, tr_idx, is_train=True,  shared_epoch=tr_shared_epoch)
-            val_loader   = engine._make_loader(cfg, all_paths, targets, val_idx, is_train=False, shared_epoch=val_shared_epoch)
+            val_loader   = engine._make_loader(cfg, all_paths, targets, val_idx, is_train=False, shared_epoch=None)
 
             epochs_no_improve = 0
             local_best_auc = best_auc
@@ -193,9 +192,9 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
                 # epoch completed successfully; clear resume marker
                 engine.clear_resume_marker(cfg)
 
-                # bump shared epoch so workers drop caches for next epoch
+                # bump ONLY training shared epoch so train workers drop caches for next epoch
                 engine.bump_shared_epoch(tr_shared_epoch)
-                engine.bump_shared_epoch(val_shared_epoch)
+                # (no validation bump; keep val cache warm)
 
                 if val_auc > local_best_auc:
                     local_best_auc = val_auc
@@ -216,6 +215,7 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
         return float("-inf")  # bad objective for maximize
 
     return float(best_auc)
+
 
 
 # --- Optuna 4.x driver ---
@@ -280,9 +280,7 @@ def run_hpo(cfg: DictConfig) -> float:
 
 def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
     """
-    Curses-wrapped training entry. Clears the terminal at each epoch.
-    Resumable: writes a resume marker at the start of each epoch,
-    clears it upon successful completion, so mid-epoch exits resume precisely.
+    Curses-wrapped training entry. Keeps validation cache warm by not tying it to a shared epoch.
     """
     # ── Curses screen setup ────────────────────────────────────────────────
     stdscr.nodelay(True)
@@ -320,9 +318,8 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
     (train_loader_dummy, val_loader_dummy, folds,
      all_paths, targets, kornia_tf) = engine.build_dataloaders(cfg, device)
 
-    # shared epoch counters
-    tr_shared_epoch  = engine.create_shared_epoch(0)
-    val_shared_epoch = engine.create_shared_epoch(0)
+    # shared epoch counter ONLY for training; validation stays cache-warm
+    tr_shared_epoch = engine.create_shared_epoch(0)
 
     model, ema = engine.build_model(cfg, device)
     criterion = engine.build_loss(cfg).to(device)
@@ -357,7 +354,8 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
             logger.info(fold_msg)
 
             train_loader = engine._make_loader(cfg, all_paths, targets, tr_idx, is_train=True,  shared_epoch=tr_shared_epoch)
-            val_loader   = engine._make_loader(cfg, all_paths, targets, val_idx, is_train=False, shared_epoch=val_shared_epoch)
+            # Validation loader WITHOUT a shared epoch => cache persists across epochs
+            val_loader   = engine._make_loader(cfg, all_paths, targets, val_idx, is_train=False, shared_epoch=None)
 
             epochs_no_improve = 0
             local_best_auc = best_auc
@@ -392,9 +390,9 @@ def run_training(stdscr: "curses._CursesWindow", cfg: DictConfig) -> float:
                 # Epoch completed successfully; clear marker.
                 engine.clear_resume_marker(cfg)
 
-                # bump shared epoch so workers drop caches for next epoch
+                # bump ONLY training shared epoch so train workers drop caches for next epoch
                 engine.bump_shared_epoch(tr_shared_epoch)
-                engine.bump_shared_epoch(val_shared_epoch)
+                # (no validation bump; keep val cache warm)
 
                 if val_auc > local_best_auc:
                     local_best_auc = val_auc
