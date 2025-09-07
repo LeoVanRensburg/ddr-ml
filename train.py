@@ -221,6 +221,7 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
 # --- Optuna 4.x driver ---
 def run_hpo(cfg: DictConfig) -> float:
     # Force sequential HPO so curses can own the TTY per trial.
+    from omegaconf import open_dict  # local import to keep this method self-contained
     with open_dict(cfg.hpo):
         cfg.hpo.n_jobs = 1
 
@@ -247,20 +248,42 @@ def run_hpo(cfg: DictConfig) -> float:
 
         # Compute a stable, param-hashed checkpoint dir now (also visible to user)
         _ensure_stable_checkpoint_dir(cfg_trial)
-        trial.set_user_attr("ckpt_dir", cfg_trial.checkpoint.dir)
-        logger.info(f"[Trial {trial.number}] ckpt_dir={cfg_trial.checkpoint.dir}")
+        ckpt_dir = cfg_trial.checkpoint.dir
+        trial.set_user_attr("ckpt_dir", ckpt_dir)
+        logger.info(f"[Trial {trial.number}] ckpt_dir={ckpt_dir}")
 
-        # Run this trial with curses so 'P' pause works.
-        # curses.wrapper handles terminal init/teardown even on exceptions.
+        best_auc: float
         try:
+            # Run this trial with curses so 'P' pause works.
+            # curses.wrapper handles terminal init/teardown even on exceptions.
             best_auc = curses.wrapper(run_training, cfg_trial)
+            return float(best_auc)
         except Exception:
             if fail_on_error:
+                # Ensure cleanup still runs via finally; then re-raise.
                 raise
             logger.exception(f"[Trial {trial.number}] continuing after error; returning -inf")
             return float("-inf")
+        finally:
+            # ── Cleanup per-trial checkpoint directory to prevent disk creep ──
+            try:
+                import os, shutil
+                # Only delete if the path is inside the configured base_dir
+                base = getattr(cfg_trial.checkpoint, "base_dir", "checkpoints")
+                base_abs = os.path.abspath(hydra_utils.to_absolute_path(base))
+                ckpt_abs = os.path.abspath(ckpt_dir)
 
-        return float(best_auc)
+                # Add os.sep to avoid prefix collisions (e.g., /foo/bar and /foo/barley)
+                if ckpt_abs.startswith(base_abs + os.sep):
+                    shutil.rmtree(ckpt_abs, ignore_errors=True)
+                    logger.info(f"[Trial {trial.number}] cleaned checkpoint dir: {ckpt_abs}")
+                else:
+                    logger.warning(
+                        f"[Trial {trial.number}] skip cleanup; ckpt outside base_dir "
+                        f"(ckpt={ckpt_abs}, base={base_abs})"
+                    )
+            except Exception as e:
+                logger.warning(f"[Trial {trial.number}] checkpoint cleanup failed: {e}")
 
     # Sequential optimize (n_jobs=1) so only one curses UI is active at a time.
     study.optimize(objective, n_trials=int(hcfg.n_trials), n_jobs=1, callbacks=callbacks)
