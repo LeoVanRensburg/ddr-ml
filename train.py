@@ -12,13 +12,12 @@ from hydra.core.hydra_config import HydraConfig
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from rich import traceback
-import json, hashlib  # add to imports
+import json, hashlib
 from hydra import utils as hydra_utils
 import copy
 import optuna
 from optuna.trial import TrialState
 from omegaconf import open_dict
-import pathlib
 
 import engine
 
@@ -242,7 +241,6 @@ def run_training_nocurses(cfg: DictConfig, rethrow_errors: bool = False) -> floa
 # --- Optuna 4.x driver ---
 def run_hpo(cfg: DictConfig) -> float:
     # Force sequential HPO so curses can own the TTY per trial.
-    from omegaconf import open_dict  # keep local to avoid import side-effects
     with open_dict(cfg.hpo):
         cfg.hpo.n_jobs = 1
 

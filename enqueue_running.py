@@ -2,8 +2,8 @@
 import optuna
 from optuna.trial import TrialState
 
-STORAGE = "sqlite:///optuna.db"   # must match your CLI
-STUDY   = "DDR_ML"                # must match your CLI
+STORAGE = "sqlite:///optunahpo.db"   # must match conf/hpo/space.yaml
+STUDY   = "ddr_search"               # must match conf/hpo/space.yaml
 
 study = optuna.create_study(storage=STORAGE, study_name=STUDY, load_if_exists=True)
 running = [t for t in study.get_trials(deepcopy=False) if t.state == TrialState.RUNNING]

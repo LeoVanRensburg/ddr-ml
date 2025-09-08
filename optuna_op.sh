@@ -1,4 +1,5 @@
-python train.py --config-path conf --config-name config \
+#!/usr/bin/env bash
+python train.py \
   +hpo=space \
   scheduler.t_initial=10 \
   early_stop.patience=2 \
